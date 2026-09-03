@@ -1,0 +1,378 @@
+{
+  "id": "shweta/xero-ledger",
+  "name": "Xero Ledger Airlock - an approval binds to the ledger state you reviewed",
+  "version": "0.1.0",
+  "provider": "xero-accounting",
+  "category": "Finance",
+  "homepage": "https://github.com/shwetadinkar/xero-ledger-railcall",
+  "tests_url": "https://github.com/shwetadinkar/xero-ledger-railcall/blob/main/test_handler.py",
+  "video_url": "",
+  "description": "Governed Xero for teams too small for a compliance function. 10 commands across invoices, payments and the chart of accounts. Every write is held behind the airlock and sealed into a signed receipt.\n\nTHE IDEA: Xero validates the write. It does not validate that the write is still the one you approved. Between the moment you review a batch and the moment it commits, a payment can land, an invoice can be recoded, a period can close - and the resulting write is still legal, so nothing stops it. This module refuses it.\n\nEvery apply command re-reads the ledger, recomputes a fingerprint covering totals, amounts paid and every line item's account code, and refuses the whole batch on any drift - naming what moved. The approval binds to the plan's CONTENT, not to a filename.\n\nWHAT IT DOES NOT CLAIM: Xero refuses a void on a paid invoice and refuses an overpayment by itself. On those, this module is defence in depth - it refuses earlier, at plan time, so you never approve something that cannot succeed. It says so in the command output rather than implying it is the only guard.\n\ncontest:round2",
+  "credential_spec": {
+    "provider": "xero-accounting",
+    "category": "accounting",
+    "name": "Xero Accounting API",
+    "required": [
+      "client_id",
+      "client_secret",
+      "refresh_token",
+      "tenant_id"
+    ],
+    "optional": [],
+    "shape": "dict",
+    "risk": "high",
+    "read_write": "write"
+  },
+  "requires": {
+    "subprocess": false,
+    "network": [
+      "api.xero.com",
+      "identity.xero.com"
+    ],
+    "filesystem_writes": [
+      "**/.railcall/station/.railcall_workspace/xero_ledger_*.json"
+    ]
+  },
+  "allowed_destinations": [
+    {
+      "provider": "xero-accounting",
+      "hosts": [
+        "api.xero.com",
+        "identity.xero.com"
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "id": "xero_accounting.verify_connection",
+      "title": "Preflight: which reads this token can perform, and what it cannot prove",
+      "provider": "xero-accounting",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {},
+      "output_schema": {
+        "ready": "string",
+        "tenants": "array",
+        "connection_id": "string",
+        "inferred_scopes": "object",
+        "rate": "object",
+        "token": "object",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Probes each scope group with one cheap read and reports what the API refused. Xero publishes no granted-scope set, so this is inference, never introspection. Also reports the tenant list, the connection id, live rate-limit quota and when the refresh token last rotated."
+    },
+    {
+      "id": "xero_accounting.describe_org",
+      "title": "The codes every other command needs: accounts, tax rates, lock dates",
+      "provider": "xero-accounting",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {},
+      "output_schema": {
+        "artifact": "string",
+        "counts": "object",
+        "limits": "array",
+        "period_lock": "string"
+      },
+      "schedulable": false,
+      "description": "Writes the chart of accounts, tax rates, tracking categories and the organisation's period lock dates to a file. Output is almost entirely ids and codes, which a receipt would redact, so the operator gets a path."
+    },
+    {
+      "id": "xero_accounting.hygiene_scan",
+      "title": "What is quietly rotting, each finding naming the command that fixes it",
+      "provider": "xero-accounting",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "draft_days": {
+          "type": "number",
+          "required": false,
+          "description": "flag DRAFT invoices older than this (default 14)"
+        },
+        "overdue_days": {
+          "type": "number",
+          "required": false,
+          "description": "flag AUTHORISED invoices overdue past this (default 1)"
+        },
+        "max_findings": {
+          "type": "number",
+          "required": false,
+          "description": "refuse past this many rather than truncate (default 1000)"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "counts": "object",
+        "limits": "array"
+      },
+      "schedulable": true,
+      "description": "Scans for drafts past N days, overdue authorised invoices bucketed for dunning, overpaid invoices, and contacts missing a default account or tax type. Every finding names the governed command that would fix it."
+    },
+    {
+      "id": "xero_accounting.verify_ledger",
+      "title": "Re-walk the local write ledger and report the first break",
+      "provider": "xero-accounting",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {},
+      "output_schema": {
+        "entries": "number",
+        "chain_intact": "string",
+        "first_break": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Hash-chain integrity check over every applied write and every refusal this module recorded. Tamper-evident, not tamper-proof: it detects edits and mid-chain deletion, not truncation of the tail by whoever holds the file."
+    },
+    {
+      "id": "xero_accounting.plan_invoice_post",
+      "title": "Resolve invoices to an explicit list and fingerprint it",
+      "provider": "xero-accounting",
+      "risk": "medium",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "status": {
+          "type": "string",
+          "required": false,
+          "description": "DRAFT or SUBMITTED (default DRAFT)"
+        },
+        "contact_id": {
+          "type": "string",
+          "required": false,
+          "description": "restrict to one contact"
+        },
+        "invoice_ids": {
+          "type": "array",
+          "required": false,
+          "description": "explicit InvoiceID list; overrides the selector"
+        },
+        "max_invoices": {
+          "type": "number",
+          "required": false,
+          "description": "refuse past this many rather than truncate (default 200)"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "plan_id": "string",
+        "plan_fp": "string",
+        "count": "number",
+        "total": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Resolves a selector to an explicit invoice list with current totals, tax, amounts due and every line item's account code, then writes a plan file carrying a two-level fingerprint. Reads only; nothing is posted."
+    },
+    {
+      "id": "xero_accounting.apply_invoice_post",
+      "title": "Authorise an approved batch, refusing on any drift",
+      "provider": "xero-accounting",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "plan_path": {
+          "type": "string",
+          "required": true,
+          "description": "path to the file the matching plan_ command wrote"
+        },
+        "plan_fp": {
+          "type": "string",
+          "required": true,
+          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+        },
+        "composite_fp": {
+          "type": "string",
+          "required": false,
+          "description": "optional cross-system fingerprint for a multi-module transaction coordinator"
+        }
+      },
+      "output_schema": {
+        "committed": "number",
+        "failed": "number",
+        "refused": "number",
+        "artifact": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Re-reads every invoice in the plan, recomputes the fingerprint, and refuses the WHOLE batch on any drift, naming the offending invoice. Uses summarizeErrors=false and reads the per-element verdict, because Xero returns HTTP 200 with per-element failures inside it. This is the point of no return: an AUTHORISED invoice can no longer be deleted, only voided."
+    },
+    {
+      "id": "xero_accounting.plan_invoice_void",
+      "title": "Report why each invoice is or is not voidable",
+      "provider": "xero-accounting",
+      "risk": "medium",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "invoice_ids": {
+          "type": "array",
+          "required": true,
+          "description": "explicit InvoiceID list"
+        },
+        "max_invoices": {
+          "type": "number",
+          "required": false,
+          "description": "refuse past this many (default 200)"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "plan_id": "string",
+        "plan_fp": "string",
+        "voidable": "number",
+        "blocked": "number",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "For each candidate: status, amount paid, amount due, the full payment list, allocated credit notes, and whether the invoice date falls inside a locked period. States for each one whether it is voidable and why not."
+    },
+    {
+      "id": "xero_accounting.apply_invoice_void",
+      "title": "Void an approved batch, refusing on any drift",
+      "provider": "xero-accounting",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "plan_path": {
+          "type": "string",
+          "required": true,
+          "description": "path to the file the matching plan_ command wrote"
+        },
+        "plan_fp": {
+          "type": "string",
+          "required": true,
+          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+        },
+        "composite_fp": {
+          "type": "string",
+          "required": false,
+          "description": "optional cross-system fingerprint for a multi-module transaction coordinator"
+        }
+      },
+      "output_schema": {
+        "voided": "number",
+        "failed": "number",
+        "refused": "number",
+        "artifact": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Re-reads every invoice, refuses if a payment landed since plan, if AmountPaid moved at all, if a credit note was allocated, if the status changed, or if the period closed. Xero itself refuses a void on a paid invoice; this refuses earlier and names what changed."
+    },
+    {
+      "id": "xero_accounting.plan_payment_allocate",
+      "title": "Snapshot balances and flag any allocation that would overpay",
+      "provider": "xero-accounting",
+      "risk": "medium",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "allocations": {
+          "type": "array",
+          "required": true,
+          "description": "[{invoice_id, amount, date}] - date defaults to today"
+        },
+        "account_id": {
+          "type": "string",
+          "required": true,
+          "description": "AccountID of the bank account to pay from"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "plan_id": "string",
+        "plan_fp": "string",
+        "count": "number",
+        "total": "string",
+        "overpays": "number",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Resolves explicit (invoice, amount, date, account) tuples, snapshots each invoice's AmountDue and AmountPaid, shows resulting balances, and flags any allocation exceeding the amount due before an operator approves it."
+    },
+    {
+      "id": "xero_accounting.apply_payment_allocate",
+      "title": "Record approved payments, refusing on any drift",
+      "provider": "xero-accounting",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "plan_path": {
+          "type": "string",
+          "required": true,
+          "description": "path to the file the matching plan_ command wrote"
+        },
+        "plan_fp": {
+          "type": "string",
+          "required": true,
+          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+        },
+        "composite_fp": {
+          "type": "string",
+          "required": false,
+          "description": "optional cross-system fingerprint for a multi-module transaction coordinator"
+        }
+      },
+      "output_schema": {
+        "recorded": "number",
+        "failed": "number",
+        "refused": "number",
+        "artifact": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Re-reads every invoice and refuses on drift in AmountDue AND in AmountPaid. A rising AmountPaid means a payment landed while the allocation sat in review. Unlike a posted invoice, a payment recorded here can be deleted afterwards - this is the one reversible write in the module."
+    }
+  ],
+  "manifest_version": 2,
+  "publisher_pubkey": "be209aad9734a7e3b8b301560bcace329f26c567ca9ef0880fb8358c72ccd761"
+}

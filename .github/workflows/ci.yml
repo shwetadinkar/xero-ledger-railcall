@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Without this a red 3.9 leg hides whether 3.12 passed, and vice versa.
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # pytest is NOT installed on the station and is not used here.
+      - name: Handler tests
+        run: python3 test_handler.py
+
+      - name: Mutation tests
+        run: python3 mutation_test.py
+
+      - name: Counts agree across manifest and docs
+        run: python3 check_counts.py

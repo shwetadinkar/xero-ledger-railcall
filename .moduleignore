@@ -1,0 +1,7 @@
+fixtures/
+capture_fixtures.py
+mutation_test.py
+check_counts.py
+PUBLISH_CHECKLIST.md
+*.tar.gz
+.venv/
