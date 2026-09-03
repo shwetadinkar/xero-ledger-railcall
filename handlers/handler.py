@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Xero Ledger Airlock — governed Xero invoices and payments. v0.1.0
+"""Xero Ledger Airlock — governed Xero invoices and payments. v0.1.1
 
 THE IDEA, in one sentence:
   An approval binds to the exact ledger state a human reviewed. If any of it
@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"

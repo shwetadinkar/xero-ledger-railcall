@@ -1,4 +1,4 @@
-# COMMANDS — Xero Ledger Airlock v0.1.0
+# COMMANDS — Xero Ledger Airlock v0.1.1
 
 All 10 commands. Every one requires credentials, so the station upgrades every
 one to require runtime approval — **including the reads**. Modes below are what

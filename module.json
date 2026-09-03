@@ -1,7 +1,7 @@
 {
   "id": "shweta/xero-ledger",
   "name": "Xero Ledger Airlock - an approval binds to the ledger state you reviewed",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "provider": "xero-accounting",
   "category": "Finance",
   "homepage": "https://github.com/shwetadinkar/xero-ledger-railcall",
