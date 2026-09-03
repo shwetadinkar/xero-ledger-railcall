@@ -12,8 +12,7 @@ held behind RailCall's approval airlock and sealed into a signed receipt.
 
 **What it does not claim:** Xero refuses a void on a paid invoice, and an
 overpayment, by itself. There this module is defence in depth — it refuses at
-plan time, so you never approve what cannot succeed. Each command says so in its
-output.
+plan time. Each command says so in its output.
 
 ## Install
 
@@ -118,16 +117,37 @@ AUTHORISED. The earlier probe conclusion — that a partial POST does not blank
 unsent fields — was right but incomplete: a minimum body is not always
 sufficient. Recorded in `COMMANDS.md`.
 
+## Trust surface
+
+Two things in the source that look like shortcuts and are not.
+
+**The rotated refresh token is written to
+`.railcall_workspace/xero_ledger_token.json`, not to the vault.** Xero rotates
+its refresh token on every refresh and invalidates the previous one. The
+platform's `oauth_refresh` helper explicitly never overwrites `refresh_token`,
+which is correct for providers whose token is static, and no vault write helper
+is injected into a handler's namespace — so a module handling a rotating
+credential has nowhere else to put it. The file is 0600, on the same machine,
+never transmitted; the vault keeps the credential you pasted. This is reported to
+RailCall and the fix is small, so the arrangement is expected to be temporary.
+
+**The token endpoint is called with raw `urllib`, not the injected
+`http_post_form`.** That helper raises `RuntimeError` on any 4xx with the
+response body flattened and truncated into the message string. `invalid_grant` —
+the most important failure this module has — is a 400. Going through the helper
+would mean substring-matching an exception message, which breaks the first time
+Xero rewords anything. Raw `urllib` lets the handler read the JSON error body and
+dispatch on the machine-readable `error` field.
+
 ## Limits
 
 Drift detection is deliberately over-sensitive: a change to a field these
 commands do not read still moves `UpdatedDateUTC` and still refuses, and it
 cannot say which field moved. The local ledger is tamper-evident, not
-tamper-proof — it detects edits and mid-chain deletion, not tail truncation by
-whoever holds the file. Sales invoices (ACCREC) only in v0.1; bills, credit notes
-and bank transactions are not covered and are not reported as clean. A recorded
-payment can be deleted afterwards; a posted invoice cannot, only voided, and the
-void is itself permanent.
+tamper-proof — it detects edits and mid-chain deletion, not tail truncation.
+Sales invoices (ACCREC) only in v0.1; bills, credit notes and bank transactions
+are not covered and are not reported as clean. A recorded payment can be deleted
+afterwards; a posted invoice cannot, only voided, and the void is permanent.
 
 ## Tests
 
