@@ -1,13 +1,13 @@
 {
   "id": "shweta/xero-ledger",
   "name": "Xero Ledger Airlock - an approval binds to the ledger state you reviewed",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "provider": "xero-accounting",
   "category": "Finance",
   "homepage": "https://github.com/shwetadinkar/xero-ledger-railcall",
   "tests_url": "https://github.com/shwetadinkar/xero-ledger-railcall/blob/main/test_handler.py",
   "video_url": "",
-  "description": "Governed Xero for teams too small for a compliance function. 10 commands across invoices, payments and the chart of accounts. Every write is held behind the airlock and sealed into a signed receipt.\n\nTHE IDEA: Xero validates the write. It does not validate that the write is still the one you approved. Between the moment you review a batch and the moment it commits, a payment can land, an invoice can be recoded, a period can close - and the resulting write is still legal, so nothing stops it. This module refuses it.\n\nEvery apply command re-reads the ledger, recomputes a fingerprint covering totals, amounts paid and every line item's account code, and refuses the whole batch on any drift - naming what moved. The approval binds to the plan's CONTENT, not to a filename.\n\nWHAT IT DOES NOT CLAIM: Xero refuses a void on a paid invoice and refuses an overpayment by itself. On those, this module is defence in depth - it refuses earlier, at plan time, so you never approve something that cannot succeed. It says so in the command output rather than implying it is the only guard.\n\ncontest:round2",
+  "description": "Governed Xero for teams too small for a compliance function. 13 commands across invoices, payments, the chart of accounts and overdue-invoice chasing. Every write is held behind the airlock and sealed into a signed receipt.\n\nTHE IDEA: Xero validates the write. It does not validate that the write is still the one you approved. Between the moment you review a batch and the moment it commits, a payment can land, an invoice can be recoded, a period can close - and the resulting write is still legal, so nothing stops it. This module refuses it.\n\nEvery apply command re-reads the ledger, recomputes a fingerprint covering totals, amounts paid and every line item's account code, and refuses the whole batch on any drift - naming what moved. The approval binds to the plan's CONTENT, not to a filename.\n\nWHAT IT DOES NOT CLAIM: Xero refuses a void on a paid invoice and refuses an overpayment by itself. On those, this module is defence in depth - it refuses earlier, at plan time, so you never approve something that cannot succeed. It says so in the command output rather than implying it is the only guard.\n\nDUNNING (v0.1.2): plan_send_reminder and apply_send_reminder chase an overdue invoice as a sequence rather than an event. Xero applies NO deduplication to invoice emails - probed live, five sends produced five deliveries - so the module keeps its own hash-chained dunning record, and that record is the only thing preventing a re-run from emailing a customer twice. The plan refuses at plan time on every rule the API enforces at send time: no email address on the contact, an invoice that is not AUTHORISED, and a stage already sent. It sends one rung of the ladder per run, so a workflow that has not run for a fortnight catches up one reminder at a time instead of delivering two in a day. A part-payment holds the current stage for one cycle without resetting the ladder. The email body is Xero's own standard invoice template - this governs WHEN a customer is chased and when the chase stops, not what the message says.\n\ncontest:round2",
   "credential_spec": {
     "provider": "xero-accounting",
     "category": "accounting",
@@ -209,7 +209,7 @@
         "plan_fp": {
           "type": "string",
           "required": true,
-          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+          "description": "the plan's fingerprint, copied from the plan command's output or the plan file. Binds the approval to plan CONTENT, not to a filename. Accepted with or without the display grouping"
         },
         "composite_fp": {
           "type": "string",
@@ -281,7 +281,7 @@
         "plan_fp": {
           "type": "string",
           "required": true,
-          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+          "description": "the plan's fingerprint, copied from the plan command's output or the plan file. Binds the approval to plan CONTENT, not to a filename. Accepted with or without the display grouping"
         },
         "composite_fp": {
           "type": "string",
@@ -354,7 +354,7 @@
         "plan_fp": {
           "type": "string",
           "required": true,
-          "description": "the plan's fingerprint, copied from the plan file. Binds the approval to plan CONTENT, not to a filename"
+          "description": "the plan's fingerprint, copied from the plan command's output or the plan file. Binds the approval to plan CONTENT, not to a filename. Accepted with or without the display grouping"
         },
         "composite_fp": {
           "type": "string",
@@ -371,6 +371,126 @@
       },
       "schedulable": false,
       "description": "Re-reads every invoice and refuses on drift in AmountDue AND in AmountPaid. A rising AmountPaid means a payment landed while the allocation sat in review. Unlike a posted invoice, a payment recorded here can be deleted afterwards - this is the one reversible write in the module."
+    },
+    {
+      "id": "xero_accounting.list_contacts",
+      "title": "The contact book with reachability, in one paged read",
+      "provider": "xero-accounting",
+      "risk": "low",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "max_contacts": {
+          "type": "number",
+          "required": false,
+          "description": "refuse past this many rather than truncate (default 2000)"
+        },
+        "only_reachable": {
+          "required": false,
+          "description": "artifact carries only contacts holding an email address (default false) — pass true/false (declared with no type: the airlock's validator has no boolean branch and refuses any value for a field declared boolean)"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "counts": "object",
+        "rate": "object",
+        "limits": "array"
+      },
+      "schedulable": true,
+      "description": "Reads the whole contact book in one paged call and reports how many contacts can actually be emailed. The recipient address is never on an invoice payload, so a dunning plan cannot be built without this. Counts an empty EmailAddress and a missing EmailAddress key alike as no address - Xero returns both shapes and a key-presence test would call unreachable contacts reachable. Also surfaces the sales default account code and receivable tax type that hygiene_scan flags as missing but cannot show."
+    },
+    {
+      "id": "xero_accounting.plan_send_reminder",
+      "title": "Which overdue invoices are owed this reminder stage, and which are not",
+      "provider": "xero-accounting",
+      "risk": "medium",
+      "mode": "read",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": false,
+      "receipt_required": true,
+      "input_schema": {
+        "stage": {
+          "type": "number",
+          "required": true,
+          "description": "the ladder rung to plan, in days overdue (e.g. 7). Must be a member of ladder"
+        },
+        "ladder": {
+          "type": "array",
+          "required": false,
+          "description": "the escalation ladder in days overdue (default [7, 21, 45]). Never hardcode a threshold in a caller"
+        },
+        "invoice_ids": {
+          "type": "array",
+          "required": false,
+          "description": "restrict to these invoices; omit to consider every AUTHORISED sales invoice"
+        },
+        "max_invoices": {
+          "type": "number",
+          "required": false,
+          "description": "refuse past this many rather than truncate (default 200)"
+        },
+        "allow_empty_greeting": {
+          "required": false,
+          "description": "send to a contact with no personal first name, whose email would open 'Hi ,' (default false — such contacts are refused at plan time) — pass true/false (declared with no type: the airlock's validator has no boolean branch and refuses any value for a field declared boolean)"
+        }
+      },
+      "output_schema": {
+        "artifact": "string",
+        "plan_id": "string",
+        "plan_fp": "string",
+        "stage": "number",
+        "counts": "object",
+        "reachable_ratio": "string",
+        "amount_due_total": "string",
+        "limits": "array",
+        "greeting_policy": "string"
+      },
+      "schedulable": true,
+      "description": "Builds a plan containing ONLY the invoices that can actually be sent this stage, and records why every excluded one was excluded. Refuses at plan time on all three rules probed live against Xero: a contact with no email address, an invoice that is not AUTHORISED, and a stage this invoice has already been sent. Enforces one rung per run - an invoice forty days overdue with nothing sent is owed stage 7, not stage 21, and never both in one run. A part-payment holds the current stage for one cycle without resetting the ladder."
+    },
+    {
+      "id": "xero_accounting.apply_send_reminder",
+      "title": "Send the approved reminders, refusing on drift or a duplicate",
+      "provider": "xero-accounting",
+      "risk": "high",
+      "mode": "write_requires_approval",
+      "requires": [
+        "XERO_OAUTH"
+      ],
+      "preview": true,
+      "receipt_required": true,
+      "input_schema": {
+        "plan_path": {
+          "type": "string",
+          "required": true,
+          "description": "path to the file the matching plan_ command wrote"
+        },
+        "plan_fp": {
+          "type": "string",
+          "required": true,
+          "description": "the plan's fingerprint, copied from the plan command's output or the plan file. Binds the approval to plan CONTENT, not to a filename. Accepted with or without the display grouping"
+        },
+        "composite_fp": {
+          "type": "string",
+          "required": false,
+          "description": "optional cross-system fingerprint for a multi-module transaction coordinator"
+        }
+      },
+      "output_schema": {
+        "sent": "number",
+        "failed": "number",
+        "refused": "number",
+        "artifact": "string",
+        "limits": "array"
+      },
+      "schedulable": false,
+      "description": "Re-reads every invoice and re-reads the dunning record before sending anything, then refuses the WHOLE batch if any invoice drifted or if any stage has been sent since the plan was approved. Xero applies no deduplication to invoice emails - five sends produce five deliveries - so this record is the only guard, and an email cannot be recalled. The message body is Xero's own standard invoice template; this governs when a customer is chased, not what the message says."
     }
   ],
   "manifest_version": 2,

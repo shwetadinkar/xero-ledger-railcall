@@ -1,6 +1,6 @@
-# COMMANDS — Xero Ledger Airlock v0.1.1
+# COMMANDS — Xero Ledger Airlock v0.1.2
 
-All 10 commands. Every one requires credentials, so the station upgrades every
+All 13 commands. Every one requires credentials, so the station upgrades every
 one to require runtime approval — **including the reads**. Modes below are what
 the manifest declares, not what the station enforces.
 
@@ -154,7 +154,27 @@ What is quietly rotting, each finding naming the command that fixes it.
 
 Findings: `draft_ageing`, `submitted_ageing`, `overdue` (bucketed 1-30 / 31-60 /
 61-90 / 90+ for dunning), `overpaid`. Each row in the artifact carries the
-invoice, contact, total, amount due and a `fixed_by` naming the governed command.
+invoice, contact, `contact_id`, total, amount due and a `fixed_by` naming the
+governed command.
+
+**v0.1.2 — an `overdue` row now carries structured fields**, not only prose:
+
+```json
+{"finding": "overdue", "number": "INV-0031", "contact": "[redacted]",
+ "contact_id": "[guid]", "total": "216.50", "amount_due": "216.50",
+ "days_overdue": 47, "due_date": "2026-07-19", "bucket": "31-60",
+ "detail": "47 days overdue (bucket 31-60)",
+ "fixed_by": "xero_accounting.plan_send_reminder"}
+```
+
+v0.1.1 put the number only inside `detail`, so a caller had to regex a
+human-readable sentence for the value that decides which reminder an invoice is
+owed. Rewording the message would have silently changed which email a customer
+received. `days_overdue`, `due_date` and `contact_id` are now fields.
+
+`fixed_by` on an `overdue` row previously read `"collections / dunning"` — the
+only finding in the module naming no governed command. It now names
+`xero_accounting.plan_send_reminder`.
 
 **Stated limits**
 
@@ -182,16 +202,28 @@ Hash-chain integrity over every applied write and every refusal.
 **Example output**
 
 ```json
-{"entries": 6, "chain_intact": "yes", "first_break": "(none)"}
+{"entries": 6, "chain_intact": "yes", "first_break": "(none)",
+ "dunning_events": 12, "dunning_chain_intact": "yes",
+ "dunning_first_break": "(none)"}
 ```
 
 A broken chain reports `chain_intact: "NO"` and `first_break: "seq 3"`, naming
 the first entry whose recorded `prev` or body hash does not recompute.
 
+**v0.1.2 covers two chains**: the write ledger and the dunning state. They are
+verified by one command rather than two deliberately — an operator asking "is my
+record intact" means both files, and a separate command would let one be checked
+while the other rots. A break in the dunning chain is the more serious of the
+two: that record is the only thing preventing a duplicate reminder.
+
 **Stated limits**
 
 > tamper-evident, not tamper-proof: it detects edits and mid-chain deletion, not
 > truncation of the tail by whoever holds the file.
+
+> covers two chains: the write ledger and the dunning state. A break in the
+> dunning chain means the duplicate-send guard cannot be trusted, because that
+> record is the only thing preventing a repeat delivery.
 
 **Errors**
 
@@ -511,6 +543,273 @@ On a refusal it adds:
 | A payment fails mid-batch | halts; `failed` names it, and a limit line says how many were recorded before it and that each recorded payment **can** be deleted in Xero to reverse it |
 | `plan_fp` mismatch / plan altered / wrong command | as §6 |
 | Approval replayed | station-level: `approval already consumed by an earlier execute — approvals are single-use.` |
+
+---
+
+## What the approval binds, and what it does not
+
+v0.1.2 closed a class of defect worth stating plainly, because it changes what a
+receipt proves.
+
+`plan_fp` hashes each entry's `fp` — the **invoice's ledger state** — plus, since
+v0.1.2, an `action_fp` covering **what is being done to it**. Before that second
+half existed, an approval bound only *which rows* were acted on, never *with
+what*. Any parameter held beside the entries, or in an entry field that `fp` does
+not cover, could be edited between approval and apply while the seal still
+validated.
+
+Three were live in v0.1.1 and are now bound:
+
+| Command | Field | What editing it did |
+|---|---|---|
+| `apply_payment_allocate` | `allocate_amount`, `allocate_date` | moved a different sum, on a different date |
+| `apply_payment_allocate` | `account_id` | moved it to a different bank account |
+| `apply_invoice_void` | `blocked_because` | turned "cannot be voided" into "go ahead" |
+
+Two more plan fields are written but never read at apply — `target_status` is
+passed as a parameter, and `period_lock_epoch` is informational — so neither is
+exploitable. They are named here rather than left for a reader to re-derive.
+
+**A plan written by v0.1.1 has no `action_fp`.** Such a plan genuinely does not
+bind the amount, so applying it is refused — with its own message, not
+`PLAN FILE ALTERED`, because the file is not corrupt. Re-run the plan command
+and approve again. Plans without `action_fp` still fingerprint exactly as they
+did, so nothing else about them changes.
+
+---
+
+## 11. `list_contacts` · read · low · schedulable
+
+The contact book with reachability, in one paged read.
+
+**Inputs**
+
+| Field | Type | Default |
+|---|---|---|
+| `max_contacts` | number | 2000 |
+| `only_reachable` | boolean | false |
+
+**Example output**
+
+```json
+{"artifact": "~/.railcall_workspace/xero_ledger_contacts_2026-09-04T162503Z.json",
+ "counts": {"total": 53, "with_email": 7, "without_email": 46,
+            "with_greeting_name": 4},
+ "rate": {"X-MinLimit-Remaining": "59", "X-DayLimit-Remaining": "974"}}
+```
+
+Each artifact row carries `contact_id`, `name`, `email_address`,
+`address_state` (`"set"` / `"(none)"`), `greeting_name`, `greeting_state`,
+`contact_status`, `is_customer`,
+`sales_default_account_code`, `receivable_tax_type` and `default_currency`.
+
+**Why this command exists.** The recipient address is never on an invoice
+payload. Measured on a live org: 0 of 10 AUTHORISED invoices carried
+`EmailAddress` in the embedded contact — including the two whose contacts did
+have one. The embedded object holds only `ContactID`, `Name`, `Addresses`,
+`ContactPersons`, `Phones` and `HasValidationErrors`. So a dunning plan cannot be
+built without a separate contacts read, and this is it: **one paged call for the
+whole book, not one call per contact** against a 1,000/day tenant budget.
+
+**Stated limits**
+
+> lists what this token can see. Something excluded by scope is absent, not
+> reported as zero.
+
+> Xero is inconsistent about a missing address: some contacts carry
+> EmailAddress as an empty string and others omit the key entirely. Both are
+> counted as no address — a key-presence test would call unreachable contacts
+> reachable.
+
+> one paged read of the whole contact book, not a call per contact. Past
+> max_contacts it refuses rather than truncating.
+
+That second limit is measured, not defensive: of 53 contacts on the probe org, 25
+carried an `EmailAddress` key and only 7 held a value. A `"EmailAddress" in
+contact` test would have called eighteen unreachable contacts reachable, and each
+one becomes a plan promising a send Xero refuses.
+
+**Errors**
+
+| Condition | What you get |
+|---|---|
+| More than `max_contacts` | `Contacts returned more than max_rows=2000. Refusing rather than truncating — narrow the selector or raise the cap deliberately.` |
+| `accounting.contacts` not granted | `Contacts refused (401) — this token does not hold the scope for it. Run verify_connection to see what it can read.` |
+
+---
+
+## 12. `plan_send_reminder` · read · medium · schedulable
+
+Which overdue invoices are owed this reminder stage, and which are not.
+
+**Inputs**
+
+| Field | Type | Default |
+|---|---|---|
+| `stage` | number | **required** — the ladder rung, in days overdue |
+| `ladder` | array | `[7, 21, 45]` |
+| `invoice_ids` | array | all AUTHORISED sales invoices |
+| `max_invoices` | number | 200 |
+| `allow_empty_greeting` | boolean | false |
+
+**Example output**
+
+```json
+{"artifact": "~/.railcall_workspace/xero_ledger_plan_send_reminder_a1b2c3d4e5f6a7b8.json",
+ "plan_id": "a1b2c3d4 e5f6a7b8",
+ "plan_fp": "972d1808 fa24b657 b461d012 f8edf537 5fc3903d 1e43a254 87558651 b18d3e22",
+ "stage": 7,
+ "counts": {"considered": 10, "eligible": 2, "excluded": 8,
+            "held_for_part_payment": 1, "no_greeting_name": 3},
+ "greeting_policy": "refusing a nameless greeting",
+ "reachable_ratio": "2 of 10",
+ "amount_due_total": "433.00"}
+```
+
+`reachable_ratio` is reported rather than assumed. On the probe org only 2 of 10
+AUTHORISED invoices had a contact that could be emailed at all — a plan claiming
+to chase ten of them would be lying about eight.
+
+The artifact carries the eligible entries **and** an `excluded` list giving every
+reason each invoice was left out. An unchased invoice is as much a fact as a
+chased one.
+
+**The three plan-time refusals**, each probed live rather than read from docs:
+
+| Condition | What Xero does at send time |
+|---|---|
+| Contact has no email address | `HTTP 400` — *"Invoices for contacts with no email address assigned cannot be emailed"* |
+| Invoice is DRAFT, VOIDED or DELETED | `HTTP 400` — *"Draft, voided or deleted invoices cannot be emailed"* |
+| Stage already sent | **Nothing. Xero sends it again.** |
+| Contact has no personal first name | **Nothing. Xero sends `Hi ,`.** |
+
+The last two have no API-side guard, which is why they are ours.
+
+**The greeting rule.** Xero's template greets by the contact's *personal* first
+name and does **not** fall back to the company name — verified by a live send
+that arrived opening `Hi ,`. This checks `FirstName` and then the first contact
+person's `FirstName`, reading the **value** rather than key presence, because
+Xero omits the key on some records and returns `""` on others, exactly as it
+does for `EmailAddress`.
+
+Refused by default; `allow_empty_greeting: true` sends anyway. The default is
+refusal because a dunning email that opens `Hi ,` undermines the request it is
+making, and it cannot be recalled. The override is an **input**, so choosing to
+send one is bound into the approval and appears on the receipt — a decision
+somebody made, not an accident. `greeting_policy` in the output states which
+mode ran, and `counts.no_greeting_name` says how many were excluded for it.
+
+**What reaches the customer.** The wrapper is Xero's — subject, greeting, layout,
+and the sender, `messaging-service@post.xero.com`, under the organisation's
+display name. The invoice **line descriptions do reach the customer**, so
+invoice content is yours even though the envelope is not.
+
+**One rung per run.** An invoice forty days overdue with nothing sent is owed
+stage 7, not stage 21, and never both in one run — so a workflow that has not run
+for a fortnight catches up one reminder at a time. Asking for stage 21 in that
+state returns it in `excluded` with *"the next stage owed is 7, not 21"*.
+
+**Stated limits**
+
+> Xero applies NO deduplication to invoice emails — probed live, five sends
+> produced five deliveries. This module's dunning state is the only thing
+> preventing a duplicate; if that file is lost the chain has no memory and will
+> re-send. An email cannot be recalled.
+
+> the message body is Xero's own standard invoice template. This command governs
+> WHEN a customer is chased and when the chase stops; it cannot change what the
+> message says. Probed live: the endpoint accepts and discards any custom
+> subject or body.
+
+> a part-payment holds the current stage for one cycle and does not reset the
+> ladder. That is a policy choice, stated here so it is visible rather than
+> inferred.
+
+> reads only. Nothing is sent until apply_send_reminder runs with this plan_fp
+> and a human approval.
+
+**Errors**
+
+| Condition | What you get |
+|---|---|
+| `stage` not in `ladder` | `stage 30 is not in the ladder [7, 21, 45]. A stage outside the ladder has no position in the sequence, so 'which stage is owed next' is undefined for it.` |
+| More than `max_invoices` | `Invoices returned more than max_rows=200. Refusing rather than truncating — narrow the selector or raise the cap deliberately.` |
+
+---
+
+## 13. `apply_send_reminder` · **write_requires_approval** · high
+
+Send the approved reminders, refusing on drift or a duplicate.
+
+**Inputs**
+
+| Field | Type | Required |
+|---|---|---|
+| `plan_path` | string | yes |
+| `plan_fp` | string | **yes** — binds the approval to plan content |
+| `composite_fp` | string | no |
+
+> **v0.1.2 — `plan_fp` is returned grouped in eights** (`1c2342e8 0177abcd …`).
+> A bare 64-character digest carries a run of 13+ digits about one time in
+> twenty, and the airlock's identifier scrubber rewrites such a run to
+> `[account]` — destroying, at random, the exact value you copy into this
+> command. The plan FILE keeps the ungrouped digest, and this input accepts
+> either form.
+
+**Example output — a refusal, which is the one worth showing**
+
+```json
+{"sent": 0, "failed": 0, "refused": 2,
+ "drift": [{"invoice": "INV-0031",
+            "reason": "stage 7 has been sent since this plan was written — refusing rather than delivering a second copy"}],
+ "artifact": "~/.railcall_workspace/xero_ledger_plan_send_reminder_a1b2c3d4e5f6a7b8.json"}
+```
+
+**Example output — a successful send**
+
+```json
+{"sent": 2, "failed": 0, "refused": 0,
+ "artifact": "~/.railcall_workspace/xero_ledger_custody_send_2026-09-04T162518Z.json"}
+```
+
+**The duplicate check runs twice.** Once at plan time so nobody approves a
+duplicate, and again here against freshly-read state — because approvals have no
+expiry and a sibling run may have sent the same stage in between. Re-reading is
+one local file read; the failure it prevents is a real customer receiving the
+same reminder twice, which cannot be undone.
+
+**No idempotency key is sent.** Xero honours `Idempotency-Key` on invoice POST
+but not on this endpoint — five identical sends produced five deliveries. Sending
+one here would be decoration that reads like protection.
+
+**Refuses the whole batch**, never part of it. A partly-sent batch leaves the
+operator working out who received what, and an email cannot be recalled. On a
+send failure mid-batch it halts rather than continuing.
+
+**Stated limits**
+
+> Xero applies NO deduplication to invoice emails — probed live, five sends
+> produced five deliveries. This module's dunning state is the only thing
+> preventing a duplicate; if that file is lost the chain has no memory and will
+> re-send. An email cannot be recalled.
+
+> the message body is Xero's own standard invoice template. This command governs
+> WHEN a customer is chased and when the chase stops; it cannot change what the
+> message says.
+
+> Xero reports the send, not delivery. A recorded send is not a received email,
+> and a bounce is invisible here.
+
+**Errors**
+
+| Condition | What you get |
+|---|---|
+| Stage sent since approval | `refused`, with the reason above. Nothing is sent. |
+| Invoice no longer AUTHORISED | `status is now VOIDED — Xero refuses to email draft, voided or deleted invoices` |
+| Address removed since the plan | `the contact's email address has been removed since the plan was written` |
+| Plan file edited after approval | `APPROVAL DOES NOT MATCH THIS PLAN. You approved plan_fp=...; the file now fingerprints as ...` |
+| Stage edited in the plan file | `the stage on this entry (45) does not match the stage that was approved — the plan file has been edited since it was sealed` |
+| Approval already consumed | Platform-level: `approval already consumed by an earlier execute`. Re-approve. |
 
 ---
 

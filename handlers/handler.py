@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Xero Ledger Airlock — governed Xero invoices and payments. v0.1.1
+"""Xero Ledger Airlock — governed Xero invoices and payments. v0.1.2
 
 THE IDEA, in one sentence:
   An approval binds to the exact ledger state a human reviewed. If any of it
@@ -20,6 +20,20 @@ WHY THAT IS THE IDEA AND NOT SOMETHING LOUDER
 
   Where Xero also guards something, the command output says so. See _LIMITS.
 
+v0.1.2 ADDS DUNNING, AND ONE PROBED FACT SHAPES ALL OF IT
+  Xero does NOT dedupe invoice emails. Five sends of one invoice produced five
+  deliveries, five HTTP 204s, no warning — probed live 2026-09-04. That is the
+  opposite of Xero's Idempotency-Key behaviour on invoice POST, which genuinely
+  dedupes, so the platform-wide assumption does not carry over.
+
+  Consequence: `xero_ledger_dunning_state.json` is the ONLY thing standing
+  between a re-run and a customer receiving the same reminder twice. It is not
+  reporting. A bug in it is a customer-facing failure, so the duplicate check is
+  made twice — once at plan time so nobody approves a duplicate, and again at
+  apply time against freshly-read state, because a sibling run may have sent it
+  in between. `SentToContact` cannot help: it is a latch, set once and never
+  cleared, and it does not record WHICH stage was sent.
+
 HANDLER CONTRACT
   Each handler is `def xero_accounting_<name>(inputs, stamp) -> (output, artifact)`.
   Helpers arrive via __rc_helpers__. Output that an operator must ACT on goes to
@@ -35,7 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 TOKEN_URL = "https://identity.xero.com/connect/token"
 CONNECTIONS_URL = "https://api.xero.com/connections"
@@ -373,8 +387,24 @@ def plan_fp_of(entries):
 
     Sorted so that Xero returning the same set in a different order does not
     invalidate an approval — order is not something the operator reviewed.
+
+    `action_fp` binds WHAT IS BEING DONE to each row, not just which row it is.
+    Some plans carry a parameter the operator is really approving — which rung
+    of a dunning ladder, which bank account — and plan-level fields are NOT
+    hashed here, so a parameter stored beside the entries could be edited after
+    approval while the seal still validated. Anything of that kind belongs in
+    `action_fp`, inside the entry.
+
+    Entries without an `action_fp` hash exactly as they did before the field
+    existed, so a plan written by an earlier version still verifies rather than
+    failing as "PLAN FILE ALTERED" after an upgrade.
     """
-    return _sha(sorted(str(e.get("fp") or "") for e in entries))
+    parts = []
+    for e in entries:
+        fp = str(e.get("fp") or "")
+        act = str(e.get("action_fp") or "")
+        parts.append(fp + "|" + act if act else fp)
+    return _sha(sorted(parts))
 
 
 # ────────────────────────────────────────────────────────── ledger
@@ -417,6 +447,108 @@ def ledger_verify():
     return len(entries), True, None
 
 
+# ────────────────────────────────────────────────── dunning state
+#
+# WHY THIS FILE IS LOAD-BEARING AND THE LEDGER ABOVE IS NOT
+#
+# The write ledger records what happened, for an auditor. This records what was
+# ALREADY SENT, and it is consulted BEFORE acting. Probed live 2026-09-04: Xero
+# applies no deduplication to POST /Invoices/{id}/Email — five sends produced
+# five deliveries and five 204s. There is no idempotency key on that endpoint
+# (unlike invoice POST, where Xero's own Idempotency-Key genuinely dedupes), and
+# `SentToContact` is a latch that says "emailed at least once" without saying
+# which stage. So nothing upstream of this file prevents a duplicate delivery.
+#
+# Same chain construction as the write ledger, and the same honesty about it:
+# tamper-EVIDENT, not tamper-proof. Whoever holds the file can truncate the tail
+# and re-chain a shorter history. Detecting that needs an off-box witness, which
+# does not exist here.
+#
+# Events are append-only. Current state is a FOLD over them rather than a
+# mutable record, because "stage 21 was sent on the 3rd, then skipped on the
+# 5th because of a part-payment" is the history an operator asks about, and a
+# last-write-wins field cannot answer it.
+
+DUNNING_SENT = "sent"
+DUNNING_FAILED = "failed"
+DUNNING_REFUSED = "refused"
+DUNNING_HOLD = "part_payment_hold"
+DUNNING_SKIPPED = "skipped"
+
+
+def _dunning_path():
+    return os.path.join(_h()["WS"], FILE_PREFIX + "dunning_state.json")
+
+
+def dunning_append(invoice_id, stage, outcome, detail):
+    """Append one dunning event, chained to the previous. Returns its hash."""
+    doc = _h()["jload"](_dunning_path(), {"events": []}) or {"events": []}
+    events = doc.get("events") or []
+    prev = events[-1]["hash"] if events else None
+    body = {"seq": len(events) + 1, "prev": prev,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "invoice_id": invoice_id, "stage": int(stage),
+            "outcome": outcome, "detail": detail}
+    body["hash"] = _sha(body)
+    events.append(body)
+    _h()["jsave"](_dunning_path(), {"events": events})
+    return body["hash"]
+
+
+def dunning_verify():
+    doc = _h()["jload"](_dunning_path(), {"events": []}) or {"events": []}
+    events = doc.get("events") or []
+    prev = None
+    for e in events:
+        body = {k: v for k, v in e.items() if k != "hash"}
+        if e.get("prev") != prev or _sha(body) != e.get("hash"):
+            return len(events), False, e.get("seq")
+        prev = e["hash"]
+    return len(events), True, None
+
+
+def dunning_history():
+    """invoice_id -> [events in order]. One read, folded once per run."""
+    doc = _h()["jload"](_dunning_path(), {"events": []}) or {"events": []}
+    out = {}
+    for e in doc.get("events") or []:
+        out.setdefault(e.get("invoice_id"), []).append(e)
+    return out
+
+
+def stages_sent(hist):
+    return set(int(e["stage"]) for e in hist if e.get("outcome") == DUNNING_SENT)
+
+
+def next_due_stage(ladder, hist):
+    """The ONE stage this invoice is next owed, or None when the ladder is done.
+
+    This is where "never skip a stage, and never send two in one run" is made
+    mechanical rather than left to the caller. An invoice forty days overdue
+    that has had nothing sent is owed stage 7 — not stage 21, and not both. A
+    workflow that has not run for a fortnight therefore catches up one rung per
+    run, which is the declared behaviour in the build spec: two emails in one
+    day to somebody who heard nothing for two weeks reads as a malfunction.
+    """
+    sent = stages_sent(hist)
+    for s in ladder:
+        if int(s) not in sent:
+            return int(s)
+    return None
+
+
+def last_observed_paid(hist):
+    """AmountPaid as it stood at the most recent event carrying one."""
+    for e in reversed(hist):
+        v = (e.get("detail") or {}).get("amount_paid")
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
 def idem_key(plan_id, plan_fp, index, payload):
     """Idempotency key for one write.
 
@@ -434,6 +566,72 @@ def idem_key(plan_id, plan_fp, index, payload):
 
 
 # ──────────────────────────────────────────────────── plan binding
+
+def _grouped(digest, size=8):
+    """A hex digest in space-separated groups, for anything returned INLINE.
+
+    spec-core section 4a: the airlock's identifier scrubber rewrites any run of
+    13 or more digits to [account]. A bare 64-character hex digest carries such
+    a run roughly one time in twenty, so `plan_fp` was being destroyed in the
+    receipt at random — and it is precisely the value an operator copies into
+    the apply command. Grouping in eights caps the longest possible digit run at
+    eight, so it can never trip the threshold.
+
+    The PLAN FILE keeps the ungrouped digest. Only the display copy is grouped,
+    and load_plan accepts either.
+    """
+    s = str(digest or "")
+    return " ".join(s[i:i + size] for i in range(0, len(s), size))
+
+
+def _ungrouped(value):
+    """Normalise a fingerprint that may carry the display grouping."""
+    return "".join(str(value or "").split()).lower()
+
+
+def _action_binding(payload):
+    """Fingerprint of WHAT IS BEING DONE to one entry.
+
+    plan_fp_of hashes each entry's `fp` (its ledger state) and its `action_fp`.
+    Without the second half, an approval binds only WHICH rows are acted on,
+    never WITH WHAT — so any parameter the operator actually reviewed, held
+    beside the entries or in an unhashed entry field, could be edited between
+    approval and apply while the seal still validated.
+
+    Every apply that reads a parameter out of the plan must recompute this from
+    the entry's declared fields and refuse on a mismatch. If a value is read at
+    apply and is not inside this hash, it is unbound.
+    """
+    return _sha(payload)
+
+
+def check_action_binding(entries, rebuild, what):
+    """Refuse any entry whose declared action no longer matches what was sealed.
+
+    Two tamper routes, both closed:
+      - edit `action_fp`      -> plan_fp changes -> load_plan refuses upstream
+      - edit the field itself -> action_fp no longer recomputes -> refused here
+
+    A plan written before this binding existed has no `action_fp` at all. That
+    is refused too, with its own message: such a plan genuinely does not bind
+    %s, and silently honouring it would accept the very exposure this closes.
+    It is not corruption, so it must not be reported as "PLAN FILE ALTERED".
+    """
+    out = []
+    for e in entries:
+        if not e.get("action_fp"):
+            out.append({"invoice": e.get("number"),
+                        "reason": "this plan predates %s being bound to the "
+                                  "approval, so what was approved cannot be "
+                                  "verified. Re-run the plan command and approve "
+                                  "again." % what})
+            continue
+        if e["action_fp"] != _action_binding(rebuild(e)):
+            out.append({"invoice": e.get("number"),
+                        "reason": "%s does not match what was approved — the plan "
+                                  "file has been edited since it was sealed" % what})
+    return out
+
 
 def write_plan(kind, entries, extra=None):
     helpers = _h()
@@ -481,6 +679,12 @@ def load_plan(inputs, kind):
             "PLAN FILE ALTERED. Its recorded fingerprint no longer matches its "
             "own contents (recorded %s, recomputed %s). Re-run the plan command."
             % (str(plan.get("plan_fp"))[:16], actual[:16]))
+    # Accept the fingerprint with or without its display grouping. Plan commands
+    # return it grouped in eights so the airlock's digit-run scrubber cannot
+    # destroy it in the receipt; an operator copying from the plan FILE gets the
+    # ungrouped form. Both must work, and both normalise to the same value, so
+    # neither weakens the check.
+    claimed = _ungrouped(claimed)
     if claimed != actual:
         raise XeroApiError(
             "APPROVAL DOES NOT MATCH THIS PLAN. You approved plan_fp=%s; the file "
@@ -516,6 +720,121 @@ _L_PAY = ("consistent with the payment having been recorded in the ledger, "
           "afterwards — the one reversible write in this module.")
 _L_POST = ("moving an invoice to AUTHORISED is the point of no return: it can "
            "no longer be deleted, only voided, and the void is permanent too.")
+_L_SEND = ("Xero applies NO deduplication to invoice emails — probed live, five "
+           "sends produced five deliveries. This module's dunning state is the "
+           "only thing preventing a duplicate; if that file is lost the chain "
+           "has no memory and will re-send. An email cannot be recalled.")
+_L_SEND_BODY = ("the message body is Xero's own standard invoice template. This "
+                "command governs WHEN a customer is chased and when the chase "
+                "stops; it cannot change what the message says. Probed live: the "
+                "endpoint accepts and discards any custom subject or body.")
+_L_SEND_DELIV = ("Xero reports the send, not delivery. A recorded send is not a "
+                 "received email, and a bounce is invisible here.")
+_L_REACH = ("the recipient address is never present on the invoice payload; it "
+            "comes from a separate Contacts read. A contact with no address "
+            "cannot be emailed at all, so the reachable count is reported rather "
+            "than assumed.")
+_L_GREETING = ("Xero's template greets by the contact's personal first name and "
+               "does NOT fall back to the company name — a contact without one "
+               "receives an email opening \"Hi ,\". Verified live. By default "
+               "such a contact is refused at plan time; set "
+               "allow_empty_greeting=true to send anyway, which puts that "
+               "decision inside the approved inputs rather than leaving it to "
+               "chance.")
+_L_EMAIL_ABSENT = ("Xero is inconsistent about a missing address: some contacts "
+                   "carry EmailAddress as an empty string and others omit the "
+                   "key entirely. Both are counted as no address — a key-presence "
+                   "test would call the empty ones reachable.")
+
+
+def _contact_email(contact):
+    """The address, or "" — treating BOTH absence shapes as no address.
+
+    Measured on a live org: 25 of 53 contacts carried an `EmailAddress` key and
+    only 7 held a non-empty value. So `"EmailAddress" in contact` is the wrong
+    test — it would call eighteen unreachable contacts reachable, and each one
+    of those becomes a plan promising a send that Xero refuses with HTTP 400.
+    """
+    return str((contact or {}).get("EmailAddress") or "").strip()
+
+
+def _as_bool(v, default=False):
+    """Coerce a flag the airlock cannot type-check for us.
+
+    approval_airlock's validator (approval_airlock.py, _validate) knows exactly
+    four type names — array, string, number, object — plus "no type declared".
+    There is NO boolean branch, so a field declared "type": "boolean" is
+    REFUSED with "wrong type" the moment anyone supplies a value. Declaring one
+    makes the input permanently unusable.
+
+    So a flag has to be declared with no type at all, which means the airlock
+    performs no checking on it whatsoever — and a bare bool() would then read
+    the string "false" as True, silently inverting the operator's intent on a
+    field whose whole job is to gate a customer-facing send. Hence this.
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return default
+
+
+def _as_int(v, default):
+    """Coerce a numeric input WITHOUT swallowing a legitimate zero.
+
+    The obvious `int(inputs.get("x") or default)` treats 0 as absent, because 0
+    is falsy — so an operator asking for `overdue_days: 0` ("everything due
+    today or later") silently gets 1, and `max_findings: 0` silently gets 1000.
+    The command does something other than what was asked and says nothing,
+    which is the quiet half of the same family as the boolean bug: the input is
+    accepted, and ignored.
+
+    Only None and "" mean "not supplied".
+    """
+    if v is None or v == "":
+        return int(default)
+    return int(v)
+
+
+def _contact_greeting_name(contact):
+    """The name Xero's invoice template will greet by, or "".
+
+    Learned from a live send: an invoice emailed to a contact with a company
+    `Name` and no personal first name arrived opening "Hi ," — Xero renders the
+    gap and does NOT fall back to the company name. A dunning email that opens
+    with a broken greeting undermines the exact request it is making, and like
+    any send it cannot be recalled.
+
+    Checks `FirstName` and then the first contact person, because both are
+    plausible template sources and covering both is cheaper than being wrong.
+    Absence has the same two shapes as EmailAddress — Xero omits the key on some
+    records and returns "" on others — so this tests the VALUE, never presence.
+    """
+    c = contact or {}
+    first = str(c.get("FirstName") or "").strip()
+    if first:
+        return first
+    for p in (c.get("ContactPersons") or []):
+        pn = str((p or {}).get("FirstName") or "").strip()
+        if pn:
+            return pn
+    return ""
+
+
+def _iso_day(epoch):
+    """Epoch -> YYYY-MM-DD, or "" — never a raw Xero /Date(...)/ string.
+
+    Raw Xero dates carry a 13-digit millisecond run, which the airlock's
+    identifier scrubber rewrites to [account]. These land in artifacts rather
+    than inline, but an artifact an operator reads should still be legible.
+    """
+    if epoch is None:
+        return ""
+    return time.strftime("%Y-%m-%d", time.gmtime(epoch))
 
 
 # ──────────────────────────────────────────────────────── 1. verify
@@ -658,19 +977,22 @@ def xero_accounting_describe_org(inputs, stamp):
 
 def xero_accounting_hygiene_scan(inputs, stamp):
     token = refresh_token()
-    draft_days = int(inputs.get("draft_days") or 14)
-    overdue_days = int(inputs.get("overdue_days") or 1)
-    cap = int(inputs.get("max_findings") or 1000)
+    draft_days = _as_int(inputs.get("draft_days"), 14)
+    overdue_days = _as_int(inputs.get("overdue_days"), 1)
+    cap = _as_int(inputs.get("max_findings"), 1000)
     now = time.time()
 
     findings = []
 
-    def add(kind, inv, detail, fixed_by):
-        findings.append({"finding": kind, "invoice_id": inv.get("InvoiceID"),
-                         "number": inv.get("InvoiceNumber"),
-                         "contact": (inv.get("Contact") or {}).get("Name"),
-                         "total": inv.get("Total"), "amount_due": inv.get("AmountDue"),
-                         "detail": detail, "fixed_by": fixed_by})
+    def add(kind, inv, detail, fixed_by, extra=None):
+        row = {"finding": kind, "invoice_id": inv.get("InvoiceID"),
+               "number": inv.get("InvoiceNumber"),
+               "contact": (inv.get("Contact") or {}).get("Name"),
+               "contact_id": (inv.get("Contact") or {}).get("ContactID"),
+               "total": inv.get("Total"), "amount_due": inv.get("AmountDue"),
+               "detail": detail, "fixed_by": fixed_by}
+        row.update(extra or {})
+        findings.append(row)
 
     invoices, hd = get_all("Invoices", token, params={"where": 'Type=="ACCREC"'},
                            max_rows=cap * 2, key="Invoices")
@@ -688,8 +1010,15 @@ def xero_accounting_hygiene_scan(inputs, stamp):
         elif status == "AUTHORISED" and due and (now - due) / 86400 >= overdue_days:
             od = int((now - due) / 86400)
             bucket = "1-30" if od <= 30 else ("31-60" if od <= 60 else ("61-90" if od <= 90 else "90+"))
+            # days_overdue, due_date and contact_id are STRUCTURED fields, not
+            # prose. v0.1.1 put the number only inside `detail` — "47 days
+            # overdue (bucket 31-60)" — so anything downstream had to regex a
+            # human-readable sentence to get the value that decides which stage
+            # an invoice is owed. A sentence is not an interface: rewording the
+            # message would silently change which reminder a customer receives.
             add("overdue", inv, "%d days overdue (bucket %s)" % (od, bucket),
-                "collections / dunning")
+                "xero_accounting.plan_send_reminder",
+                {"days_overdue": od, "due_date": _iso_day(due), "bucket": bucket})
         try:
             if float(inv.get("AmountPaid") or 0) > float(inv.get("Total") or 0):
                 add("overpaid", inv, "AmountPaid exceeds Total",
@@ -721,10 +1050,22 @@ def xero_accounting_hygiene_scan(inputs, stamp):
 
 def xero_accounting_verify_ledger(inputs, stamp):
     n, intact, first_break = ledger_verify()
+    # The dunning chain is verified here too rather than in a command of its own.
+    # It is the same construction and the same claim, and an operator asking "is
+    # my record intact" means both files — a separate command would let one be
+    # checked while the other rots.
+    dn, dintact, dbreak = dunning_verify()
     return {"entries": n,
             "chain_intact": "yes" if intact else "NO",
             "first_break": ("seq %s" % first_break) if first_break else "(none)",
-            "limits": [_L_CHAIN]}, None
+            "dunning_events": dn,
+            "dunning_chain_intact": "yes" if dintact else "NO",
+            "dunning_first_break": ("seq %s" % dbreak) if dbreak else "(none)",
+            "limits": [_L_CHAIN,
+                       "covers two chains: the write ledger and the dunning "
+                       "state. A break in the dunning chain means the duplicate-"
+                       "send guard cannot be trusted, because that record is the "
+                       "only thing preventing a repeat delivery."]}, None
 
 
 # ──────────────────────────────────────────── 5/6. invoice post
@@ -771,7 +1112,7 @@ def _entry(inv):
 
 def xero_accounting_plan_invoice_post(inputs, stamp):
     token = refresh_token()
-    cap = int(inputs.get("max_invoices") or 200)
+    cap = _as_int(inputs.get("max_invoices"), 200)
     invs = _fetch_invoices(token, ids=inputs.get("invoice_ids"),
                            status=(inputs.get("status") or "DRAFT").upper(),
                            contact_id=inputs.get("contact_id"), cap=cap)
@@ -781,7 +1122,9 @@ def xero_accounting_plan_invoice_post(inputs, stamp):
     entries = [_entry(i) for i in invs]
     total = sum(float(e.get("total") or 0) for e in entries)
     plan, path = write_plan("invoice_post", entries, {"target_status": "AUTHORISED"})
-    return {"artifact": path, "plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+    return {"artifact": path,
+            "plan_id": _grouped(plan["plan_id"]),
+            "plan_fp": _grouped(plan["plan_fp"]),
             "count": len(entries), "total": "%.2f" % total,
             "limits": [_L_POST, _L_DRIFT,
                        "reads only. Nothing is posted until apply_invoice_post "
@@ -920,7 +1263,7 @@ def xero_accounting_plan_invoice_void(inputs, stamp):
     ids = inputs.get("invoice_ids") or []
     if not ids:
         raise XeroApiError("invoice_ids is required.")
-    cap = int(inputs.get("max_invoices") or 200)
+    cap = _as_int(inputs.get("max_invoices"), 200)
     if len(ids) > cap:
         raise XeroApiError("more than max_invoices=%d — refusing rather than truncating." % cap)
 
@@ -965,6 +1308,13 @@ def xero_accounting_plan_invoice_void(inputs, stamp):
                          for p in (inv.get("Payments") or [])]
         e["voidable"] = not reasons
         e["blocked_because"] = reasons
+        # _void_guard REFUSES on blocked_because at apply time, so that list is
+        # a control, not a display field — and it was not inside the
+        # fingerprint. Emptying it on a sealed plan turned "this invoice cannot
+        # be voided" into "go ahead" with the approval still valid. Xero backs
+        # some of those reasons up (it refuses a void on a paid invoice) but not
+        # all of them: a period-lock or credit-note block was ours alone.
+        e["action_fp"] = _action_binding({"blocked_because": sorted(reasons)})
         entries.append(e)
         voidable += 1 if not reasons else 0
         blocked += 1 if reasons else 0
@@ -972,7 +1322,9 @@ def xero_accounting_plan_invoice_void(inputs, stamp):
     plan, path = write_plan("invoice_void", entries,
                             {"target_status": "VOIDED",
                              "period_lock_epoch": lock_epoch})
-    return {"artifact": path, "plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+    return {"artifact": path,
+            "plan_id": _grouped(plan["plan_id"]),
+            "plan_fp": _grouped(plan["plan_fp"]),
             "voidable": voidable, "blocked": blocked,
             "limits": [_L_VOID, _L_DRIFT]}, {"path": path, "kind": "plan_invoice_void"}
 
@@ -982,7 +1334,10 @@ def _void_guard(plan, fresh):
     acquired a payment since. Checked separately from the fingerprint because
     an operator can approve a plan containing blocked rows — the plan is a
     report as well as a request."""
-    out = []
+    out = check_action_binding(
+        plan["entries"],
+        lambda e: {"blocked_because": sorted(e.get("blocked_because") or [])},
+        "the plan-time voidability verdict")
     for e in plan["entries"]:
         if e.get("blocked_because"):
             out.append({"invoice": e.get("number"),
@@ -1030,6 +1385,18 @@ def xero_accounting_plan_payment_allocate(inputs, stamp):
         e["allocate_date"] = a.get("date") or today()
         e["resulting_due"] = round(due - amount, 2)
         e["overpays"] = amount > due
+        # THE AMOUNT, THE DATE AND THE DESTINATION ACCOUNT ARE WHAT THE OPERATOR
+        # APPROVED. None of them was inside the fingerprint before v0.1.2:
+        # plan_fp hashes each entry's `fp`, which is the INVOICE's state, and
+        # amount/date sat beside it while account_id sat at plan level. So a
+        # sealed, validly-approved plan could be edited to move a different sum
+        # to a different bank account and the receipt would still verify. That is
+        # the module's own central claim failing on the one write that moves
+        # money. account_id goes into every entry's binding rather than being
+        # checked once, so the approval covers the destination per row.
+        e["action_fp"] = _action_binding({"account_id": account_id,
+                                          "amount": amount,
+                                          "date": e["allocate_date"]})
         if e["overpays"]:
             overpays += 1
         total += amount
@@ -1041,7 +1408,9 @@ def xero_accounting_plan_payment_allocate(inputs, stamp):
         limits.append("%d allocation(s) exceed the amount due. Xero will refuse "
                       "those writes; they are flagged here so you do not approve "
                       "a batch that cannot succeed." % overpays)
-    return {"artifact": path, "plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+    return {"artifact": path,
+            "plan_id": _grouped(plan["plan_id"]),
+            "plan_fp": _grouped(plan["plan_fp"]),
             "count": len(entries), "total": "%.2f" % total, "overpays": overpays,
             "limits": limits}, {"path": path, "kind": "plan_payment_allocate"}
 
@@ -1062,6 +1431,25 @@ def xero_accounting_apply_payment_allocate(inputs, stamp):
                            "reviewed amount now would overpay the invoice."]}, None
 
     account_id = plan.get("account_id")
+    # Recompute every entry's binding from the fields this apply is about to
+    # ACT on, including the plan-level account_id. A mismatch means the amount,
+    # the date or the destination account moved after the human sealed it.
+    unbound = check_action_binding(
+        plan["entries"],
+        lambda e: {"account_id": account_id,
+                   "amount": e.get("allocate_amount"),
+                   "date": e.get("allocate_date")},
+        "the payment amount, date or destination account")
+    if unbound:
+        ledger_append("apply_payment_allocate", "refused_unbound",
+                      {"plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+                       "unbound": unbound[:20]})
+        return {"recorded": 0, "failed": 0, "refused": len(plan["entries"]),
+                "drift": unbound[:20], "artifact": path,
+                "limits": [_L_PAY,
+                           "REFUSED. What this plan would pay is not what was "
+                           "approved. Nothing was recorded."]}, None
+
     recorded, failed = [], []
     for idx, e in enumerate(plan["entries"]):
         # Payments POST one at a time: Xero has no per-element verdict for this
@@ -1112,3 +1500,441 @@ def xero_accounting_apply_payment_allocate(inputs, stamp):
                       "if you need to reverse it." % len(recorded))
     return {"recorded": len(recorded), "failed": len(failed), "refused": 0,
             "artifact": rpath, "limits": limits}, {"path": rpath, "kind": "payment_allocate"}
+
+
+# ─────────────────────────────────────────── 11. list contacts
+
+def _load_contacts(token, cap=2000):
+    """Every contact, in ONE paged read. contact_id -> contact.
+
+    Deliberately not a call per contact. The address is never on the invoice
+    payload — measured: 0 of 10 authorised invoices carried EmailAddress, and
+    the embedded Contact holds only ContactID, Name, Addresses, ContactPersons,
+    Phones and HasValidationErrors. So it has to come from /Contacts, and the
+    list endpoint returns it. Per-contact reads would burn one call each against
+    a 1,000/day tenant budget to fetch what one paged read already has.
+    """
+    rows, _ = get_all("Contacts", token, max_rows=cap, key="Contacts")
+    return {c.get("ContactID"): c for c in rows}
+
+
+def xero_accounting_list_contacts(inputs, stamp):
+    token = refresh_token()
+    cap = _as_int(inputs.get("max_contacts"), 2000)
+    rows, hd = get_all("Contacts", token, max_rows=cap, key="Contacts")
+
+    only_reachable = _as_bool(inputs.get("only_reachable"))
+    out_rows, reachable, greetable = [], 0, 0
+    for c in rows:
+        addr = _contact_email(c)
+        if _contact_greeting_name(c):
+            greetable += 1
+        if addr:
+            reachable += 1
+        elif only_reachable:
+            continue
+        out_rows.append({
+            "contact_id": c.get("ContactID"),
+            "name": c.get("Name"),
+            "email_address": addr,
+            # A STATUS word inline-safe by construction, so a reader of the
+            # artifact does not have to infer reachability from an empty string
+            # that Xero may also have omitted entirely.
+            "address_state": "set" if addr else "(none)",
+            "greeting_name": _contact_greeting_name(c),
+            "greeting_state": "set" if _contact_greeting_name(c) else "(none)",
+            "contact_status": c.get("ContactStatus"),
+            "is_customer": c.get("IsCustomer"),
+            # Carried for the v0.2 work that wanted a per-contact describe:
+            # hygiene_scan already flags these as missing but could not show them.
+            "sales_default_account_code": c.get("SalesDefaultAccountCode"),
+            "receivable_tax_type": c.get("AccountsReceivableTaxType"),
+            "default_currency": c.get("DefaultCurrency"),
+        })
+
+    doc = {"generated_at": stamp, "total": len(rows), "reachable": reachable,
+           "greetable": greetable, "contacts": out_rows}
+    path = os.path.join(_h()["WS"], "%scontacts_%s.json"
+                        % (FILE_PREFIX, stamp.replace(":", "")))
+    _h()["jsave"](path, doc)
+    return {"artifact": path,
+            "counts": {"total": len(rows), "with_email": reachable,
+                       "without_email": len(rows) - reachable,
+                       "with_greeting_name": greetable},
+            "rate": rate_of(hd),
+            "limits": [_L_SCOPED, _L_EMAIL_ABSENT, _L_GREETING,
+                       "one paged read of the whole contact book, not a call per "
+                       "contact. Past max_contacts it refuses rather than "
+                       "truncating."]}, {"path": path, "kind": "list_contacts"}
+
+
+# ──────────────────────────────────── 12/13. send reminder
+
+DEFAULT_LADDER = [7, 21, 45]
+
+
+def _stage_binding(stage):
+    """The approved rung, as a value plan_fp_of will hash.
+
+    Without this the approval would bind only WHICH invoices get a reminder, not
+    WHICH reminder they get. plan_fp hashes entries and nothing else, so a stage
+    recorded beside the entries could be changed from 7 to 45 between approval
+    and apply and the seal would still validate — the operator would have
+    approved a gentle first nudge and a final notice would go out. Putting it in
+    `action_fp` makes it part of what the human sealed, and apply recomputes it
+    from the declared stage so the two cannot drift apart.
+    """
+    return _action_binding({"stage": int(stage)})
+
+
+def _reminder_blockers(inv, addr, greeting, hist, stage, ladder, now,
+                       allow_empty_greeting=False):
+    """Every reason this invoice cannot be sent stage `stage`. Empty = eligible.
+
+    All three of the probed refusal rules are checked HERE, at plan time, so an
+    operator never approves a batch that Xero will reject or that would deliver
+    a second copy. spec-core section 10: a plan promising a write the API will
+    refuse spends a human approval on something that could never land — and the
+    duplicate case is worse than that, because it CAN land.
+    """
+    reasons = []
+
+    # RULE 1 — probed live: HTTP 400 "Draft, voided or deleted invoices cannot
+    # be emailed". AUTHORISED is the only sendable status.
+    status = inv.get("Status")
+    if status != "AUTHORISED":
+        reasons.append("status is %s — Xero refuses to email draft, voided or "
+                       "deleted invoices" % status)
+
+    # RULE 2 — probed live: HTTP 400 "Invoices for contacts with no email
+    # address assigned cannot be emailed".
+    if not addr:
+        reasons.append("the contact has no email address on file")
+
+    # RULE 2b — NOT an API refusal. Xero sends this one happily; it just sends
+    # something embarrassing. A dunning email opening "Hi ," undercuts the
+    # request it is making, and it is as unrecallable as any other send. So it
+    # is refused by default and overridable in the INPUTS, which means the
+    # decision to send a nameless greeting travels through the approval hash and
+    # onto the receipt instead of happening by accident.
+    if not allow_empty_greeting and not greeting:
+        reasons.append("the contact has no personal first name, so Xero's "
+                       "template would open \"Hi ,\" — it does not fall back to "
+                       "the company name. Set allow_empty_greeting=true to send "
+                       "anyway.")
+
+    # RULE 3 — the load-bearing one. Xero does not dedupe; this record is the
+    # only guard. Checked explicitly rather than left implied by the ladder
+    # arithmetic below, because it is the check whose removal sends a real
+    # customer a second copy, and it deserves to fail loudly on its own terms.
+    if int(stage) in stages_sent(hist):
+        when = next((e.get("ts") for e in reversed(hist)
+                     if e.get("outcome") == DUNNING_SENT
+                     and int(e.get("stage")) == int(stage)), "an earlier run")
+        reasons.append("stage %d was already sent on %s — Xero applies no "
+                       "deduplication, so sending again delivers a second copy"
+                       % (int(stage), when))
+
+    try:
+        if float(inv.get("AmountDue") or 0) <= 0:
+            reasons.append("nothing outstanding — the invoice is paid")
+    except (TypeError, ValueError):
+        reasons.append("AmountDue is unreadable — UNKNOWN is never a pass, so "
+                       "this is not chased")
+
+    due = parse_xero_date(inv.get("DueDateString") or inv.get("DueDate"))
+    if due is None:
+        reasons.append("no due date, so days overdue cannot be computed")
+    else:
+        od = int((now - due) / 86400)
+        if od < int(stage):
+            reasons.append("%d days overdue; stage %d is not due yet"
+                           % (od, int(stage)))
+
+    nxt = next_due_stage(ladder, hist)
+    if nxt is None:
+        reasons.append("every stage in the ladder has already been sent")
+    elif nxt != int(stage):
+        reasons.append("the next stage owed is %d, not %d — stages are never "
+                       "skipped, and never two in one run" % (nxt, int(stage)))
+    return reasons
+
+
+def _part_payment_hold(inv, hist, stage):
+    """(is_held, amount_paid). A part-payment pauses one cycle without resetting.
+
+    Somebody paying part of an invoice is engaging with it, and chasing them the
+    next day punishes exactly the behaviour the chain wants. So the stage holds
+    for one cycle and then resumes where the ladder was — it does not reset.
+
+    The hold has to be RECORDED to be released: without a record, "AmountPaid is
+    higher than at the last send" stays true forever and the invoice would be
+    held permanently. So the first run that sees the new amount writes a hold
+    event and skips; the next run finds that event and proceeds. Recording is
+    idempotent on (stage, amount_paid), so re-running the plan does not stack
+    holds or extend one.
+
+    This is a business judgement, not a technical one, which is why it is stated
+    in the command's output rather than left for an operator to infer.
+    """
+    try:
+        paid = float(inv.get("AmountPaid") or 0)
+    except (TypeError, ValueError):
+        return False, 0.0
+    if paid <= 0 or paid <= last_observed_paid(hist):
+        return False, paid
+    served = any(e.get("outcome") == DUNNING_HOLD
+                 and int(e.get("stage")) == int(stage)
+                 and float((e.get("detail") or {}).get("amount_paid") or 0) == paid
+                 for e in hist)
+    return (not served), paid
+
+
+def xero_accounting_plan_send_reminder(inputs, stamp):
+    token = refresh_token()
+    stage = _as_int(inputs.get("stage"), 0)
+    ladder = [int(x) for x in (inputs.get("ladder") or DEFAULT_LADDER)]
+    if stage not in ladder:
+        raise XeroApiError(
+            "stage %d is not in the ladder %s. A stage outside the ladder has no "
+            "position in the sequence, so 'which stage is owed next' is "
+            "undefined for it." % (stage, ladder))
+    cap = _as_int(inputs.get("max_invoices"), 200)
+    allow_empty_greeting = _as_bool(inputs.get("allow_empty_greeting"))
+
+    invs = _fetch_invoices(token, ids=inputs.get("invoice_ids"),
+                           status="AUTHORISED", cap=cap)
+    contacts = _load_contacts(token)
+    history = dunning_history()
+    now = time.time()
+
+    entries, excluded, held, nameless = [], [], 0, 0
+    for inv in invs:
+        iid = inv.get("InvoiceID")
+        cid = (inv.get("Contact") or {}).get("ContactID")
+        contact = contacts.get(cid)
+        addr = _contact_email(contact)
+        greeting = _contact_greeting_name(contact)
+        hist = history.get(iid, [])
+
+        # PAID EXITS FIRST, before any stage arithmetic and before the
+        # part-payment hold. A settled invoice is not a part-payment, and
+        # ordering these the other way round classified a customer who had paid
+        # in full as "engaging, hold one cycle" — which keeps them in the chain
+        # instead of releasing them. Chasing somebody who has already paid is
+        # the failure that destroys trust in the whole thing, so it is checked
+        # before anything can reclassify it.
+        #
+        # Deliberately NOT recorded as an event: paid-ness is re-read from Xero
+        # every run, so it needs no memory, and recording it would append a row
+        # per settled invoice per run forever.
+        try:
+            if float(inv.get("AmountDue") or 0) <= 0:
+                excluded.append({"number": inv.get("InvoiceNumber"), "invoice_id": iid,
+                                 "reasons": ["nothing outstanding — the invoice is "
+                                             "paid, so it leaves the chain"]})
+                continue
+        except (TypeError, ValueError):
+            excluded.append({"number": inv.get("InvoiceNumber"), "invoice_id": iid,
+                             "reasons": ["AmountDue is unreadable — UNKNOWN is "
+                                         "never a pass, so this is not chased"]})
+            continue
+
+        is_held, paid = _part_payment_hold(inv, hist, stage)
+        if is_held:
+            dunning_append(iid, stage, DUNNING_HOLD,
+                           {"amount_paid": paid, "number": inv.get("InvoiceNumber"),
+                            "reason": "part-payment since the last contact"})
+            excluded.append({"number": inv.get("InvoiceNumber"), "invoice_id": iid,
+                             "reasons": ["a part-payment of %s landed since the "
+                                         "last contact — holding this stage for "
+                                         "one cycle, without resetting the ladder"
+                                         % paid]})
+            held += 1
+            continue
+
+        reasons = _reminder_blockers(inv, addr, greeting, hist, stage, ladder,
+                                     now, allow_empty_greeting)
+        if reasons:
+            if any("Hi ," in r for r in reasons):
+                nameless += 1
+            excluded.append({"number": inv.get("InvoiceNumber"), "invoice_id": iid,
+                             "reasons": reasons})
+            continue
+
+        due = parse_xero_date(inv.get("DueDateString") or inv.get("DueDate"))
+        e = _entry(inv)
+        e["stage"] = int(stage)
+        # The stage is sealed through action_fp, which plan_fp_of hashes. See
+        # _stage_binding: `stage` on its own would be an unbound plan field.
+        e["action_fp"] = _stage_binding(stage)
+        e["contact_id"] = cid
+        e["email_address"] = addr
+        e["greeting_name"] = greeting
+        e["days_overdue"] = int((now - due) / 86400) if due else None
+        e["due_date"] = _iso_day(due)
+        entries.append(e)
+
+    total = sum(float(e.get("amount_due") or 0) for e in entries)
+    considered = len(invs)
+    plan, path = write_plan("send_reminder", entries,
+                            {"stage": stage, "ladder": ladder,
+                             "excluded": excluded})
+    limits = [_L_SEND, _L_SEND_BODY, _L_REACH, _L_EMAIL_ABSENT, _L_GREETING,
+              _L_DRIFT,
+              "reads only. Nothing is sent until apply_send_reminder runs with "
+              "this plan_fp and a human approval.",
+              "a part-payment holds the current stage for one cycle and does not "
+              "reset the ladder. That is a policy choice, stated here so it is "
+              "visible rather than inferred."]
+    if not entries:
+        limits.append("nothing is eligible for stage %d in this run. The "
+                      "excluded list in the artifact names why for every "
+                      "invoice considered." % stage)
+    return {"artifact": path,
+            "plan_id": _grouped(plan["plan_id"]),
+            "plan_fp": _grouped(plan["plan_fp"]),
+            "stage": stage,
+            "counts": {"considered": considered, "eligible": len(entries),
+                       "excluded": len(excluded), "held_for_part_payment": held,
+                       "no_greeting_name": nameless},
+            "greeting_policy": ("sending anyway (allow_empty_greeting=true)"
+                                if allow_empty_greeting
+                                else "refusing a nameless greeting"),
+            "reachable_ratio": "%d of %d" % (len(entries), considered),
+            "amount_due_total": "%.2f" % total,
+            "limits": limits}, {"path": path, "kind": "plan_send_reminder"}
+
+
+def xero_accounting_apply_send_reminder(inputs, stamp):
+    token = refresh_token()
+    plan, path = load_plan(inputs, "send_reminder")
+    fresh, drift = _drift_check(token, plan)
+
+    if drift:
+        for e in plan["entries"]:
+            dunning_append(e["id"], e.get("stage"), DUNNING_REFUSED,
+                           {"number": e.get("number"), "reason": "batch refused on drift"})
+        ledger_append("apply_send_reminder", "refused_drift",
+                      {"plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+                       "drift": drift[:20]})
+        return {"sent": 0, "failed": 0, "refused": len(plan["entries"]),
+                "drift": drift[:20], "artifact": path,
+                "limits": [_L_SEND,
+                           "REFUSED. Something moved between the plan and this "
+                           "approval — most often a payment landing, which is "
+                           "precisely the customer who must not be chased. "
+                           "Re-plan, review, approve again."]}, None
+
+    # RE-CHECK the duplicate guard against freshly-read state, not against the
+    # plan. The plan checked it too, but an approval has no TTL and a sibling run
+    # may have sent this exact stage in between. Reading the file again here is
+    # one jload; the failure it prevents is a real customer receiving the same
+    # reminder twice, which cannot be undone.
+    history = dunning_history()
+    contacts = _load_contacts(token)
+    # The approved rung, re-derived from each entry. See check_action_binding.
+    blocked = check_action_binding(
+        plan["entries"],
+        lambda e: {"stage": int(e.get("stage"))},
+        "the reminder stage")
+    for e in plan["entries"]:
+        hist = history.get(e["id"], [])
+        stage = int(e.get("stage"))
+        # The stage must still match the value that was sealed. plan_fp covers
+        # action_fp, so editing action_fp breaks the plan fingerprint upstream in
+        # load_plan; editing `stage` alone is caught here. Between them the rung
+        # the human approved is the rung that goes out.
+        if stage in stages_sent(hist):
+            blocked.append({"invoice": e.get("number"),
+                            "reason": "stage %d has been sent since this plan was "
+                                      "written — refusing rather than delivering a "
+                                      "second copy" % stage})
+            continue
+        cur = fresh.get(e["id"])
+        if cur is not None and cur.get("Status") != "AUTHORISED":
+            blocked.append({"invoice": e.get("number"),
+                            "reason": "status is now %s — Xero refuses to email "
+                                      "draft, voided or deleted invoices"
+                                      % cur.get("Status")})
+            continue
+        # Fresh read first: the plan's copy is a convenience, and trusting it
+        # would check one contact's address while Xero mails another's.
+        cid = ((cur or {}).get("Contact") or {}).get("ContactID") or e.get("contact_id")
+        if not _contact_email(contacts.get(cid)):
+            blocked.append({"invoice": e.get("number"),
+                            "reason": "the contact's email address has been "
+                                      "removed since the plan was written"})
+
+    if blocked:
+        for e in plan["entries"]:
+            dunning_append(e["id"], e.get("stage"), DUNNING_REFUSED,
+                           {"number": e.get("number"),
+                            "reason": "batch refused: %d entry(s) no longer sendable"
+                                      % len(blocked)})
+        ledger_append("apply_send_reminder", "refused_ineligible",
+                      {"plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+                       "blocked": blocked[:20]})
+        return {"sent": 0, "failed": 0, "refused": len(plan["entries"]),
+                "drift": blocked[:20], "artifact": path,
+                "limits": [_L_SEND,
+                           "REFUSED THE WHOLE BATCH. At least one invoice is no "
+                           "longer sendable. A partly-sent batch would leave you "
+                           "working out who received what, and an email cannot "
+                           "be recalled — so nothing was sent."]}, None
+
+    sent, failed = [], []
+    for e in plan["entries"]:
+        stage = int(e.get("stage"))
+        # No Idempotency-Key here, deliberately. Xero honours that header on
+        # invoice POST but NOT on this endpoint — probed live, five identical
+        # sends produced five deliveries. Sending one would be decoration that
+        # reads like protection, which is worse than none.
+        st, hd, body = api("POST", "Invoices/%s/Email" % e["id"], token, body={})
+        if st in (200, 204):
+            sent.append({"number": e.get("number"), "invoice_id": e["id"],
+                         "stage": stage})
+            dunning_append(e["id"], stage, DUNNING_SENT,
+                           {"number": e.get("number"),
+                            "amount_paid": e.get("amount_paid"),
+                            "amount_due": e.get("amount_due"),
+                            "days_overdue": e.get("days_overdue"),
+                            "plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"]})
+        else:
+            msg = ""
+            if isinstance(body, dict):
+                els = body.get("Elements") or []
+                errs = (els[0].get("ValidationErrors") if els else []) or []
+                msg = "; ".join(x.get("Message", "") for x in errs[:2]) or \
+                      str(body.get("Message") or body.get("Detail") or "")[:160]
+            failed.append({"number": e.get("number"), "error": msg or ("HTTP %s" % st)})
+            dunning_append(e["id"], stage, DUNNING_FAILED,
+                           {"number": e.get("number"), "error": msg or ("HTTP %s" % st)})
+            # HALT. Continuing would keep sending real email against an endpoint
+            # that has already behaved unexpectedly, and every send after this
+            # point is unrecallable.
+            break
+
+    ledger_append("apply_send_reminder", "committed" if not failed else "partial",
+                  {"plan_id": plan["plan_id"], "plan_fp": plan["plan_fp"],
+                   "stage": sorted({int(e.get("stage")) for e in plan["entries"]}),
+                   "sent": len(sent),
+                   "failed": len(failed),
+                   "composite_fp": inputs.get("composite_fp"),
+                   "ids": [s["invoice_id"] for s in sent][:50]})
+
+    result = {"plan_id": plan["plan_id"],
+              "stage": sorted({int(e.get("stage")) for e in plan["entries"]}),
+              "sent": sent, "failed": failed}
+    rpath = os.path.join(_h()["WS"], "%scustody_send_%s.json"
+                         % (FILE_PREFIX, stamp.replace(":", "")))
+    _h()["jsave"](rpath, result)
+
+    limits = [_L_SEND, _L_SEND_BODY, _L_SEND_DELIV]
+    if failed:
+        limits.append("halted at the first failure. %d reminder(s) went out "
+                      "before it and are named in the artifact. Nothing was "
+                      "rolled back because nothing can be: an email is not "
+                      "recallable." % len(sent))
+    return {"sent": len(sent), "failed": len(failed), "refused": 0,
+            "artifact": rpath, "limits": limits}, {"path": rpath, "kind": "send_reminder"}

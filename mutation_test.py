@@ -60,6 +60,91 @@ MUTATIONS = [
     ("drop the invalid_grant special case",
      "        if err == \"invalid_grant\":", "        if False:"),
 
+    ("use a bare bool() on a flag the airlock cannot type-check",
+     "    allow_empty_greeting = _as_bool(inputs.get(\"allow_empty_greeting\"))",
+     "    allow_empty_greeting = bool(inputs.get(\"allow_empty_greeting\"))"),
+
+    ("swallow a legitimate zero on a numeric input",
+     "def _as_int(v, default):\n", "def _as_int(v, default):\n    return int(v or default)\n"),
+
+    ("go back to `or default` on the overdue threshold",
+     "    overdue_days = _as_int(inputs.get(\"overdue_days\"), 1)",
+     "    overdue_days = int(inputs.get(\"overdue_days\") or 1)"),
+
+    # ---- v0.1.2 greeting rule
+
+    ("skip the empty-greeting check",
+     "    if not allow_empty_greeting and not greeting:", "    if False:"),
+
+    ("treat the company name as a greeting fallback",
+     "    first = str(c.get(\"FirstName\") or \"\").strip()",
+     "    first = str(c.get(\"FirstName\") or c.get(\"Name\") or \"\").strip()"),
+
+    ("treat a present-but-empty FirstName as a name",
+     "    first = str(c.get(\"FirstName\") or \"\").strip()",
+     "    first = \"x\" if \"FirstName\" in c else \"\""),
+
+    # ---- v0.1.2 binding. The first is the one that moves money.
+
+    ("stop binding the payment amount, date and destination account",
+     "        e[\"action_fp\"] = _action_binding({\"account_id\": account_id,",
+     "        e[\"action_fp\"] = \"\"  # MUTANT\n        _unused = ({\"account_id\": account_id,"),
+
+    ("skip the action-binding check on the payment apply",
+     "    if unbound:", "    if False:"),
+
+    ("stop binding the voidability verdict",
+     "        e[\"action_fp\"] = _action_binding({\"blocked_because\": sorted(reasons)})",
+     "        e[\"action_fp\"] = \"\"  # MUTANT"),
+
+    ("accept an entry that carries no action binding at all",
+     "        if not e.get(\"action_fp\"):", "        if False:"),
+
+    ("stop normalising a grouped fingerprint (would accept anything)",
+     "    claimed = _ungrouped(claimed)", "    claimed = claimed"),
+
+    ("return the fingerprint ungrouped, exposed to the digit scrubber",
+     "            \"plan_fp\": _grouped(plan[\"plan_fp\"]),",
+     "            \"plan_fp\": plan[\"plan_fp\"],"),
+
+    # ---- v0.1.2 dunning. The first two are the ones that reach a customer.
+
+    ("skip the duplicate-send check at PLAN time",
+     "    if int(stage) in stages_sent(hist):", "    if False:"),
+
+    ("skip the duplicate-send check at APPLY time",
+     "        if stage in stages_sent(hist):", "        if False:"),
+
+    ("treat a missing EmailAddress key as an address",
+     "    return str((contact or {}).get(\"EmailAddress\") or \"\").strip()",
+     "    return \"EmailAddress\" in (contact or {}) and \"x\" or \"\""),
+
+    ("let a non-AUTHORISED invoice be emailed",
+     "    if status != \"AUTHORISED\":", "    if False:"),
+
+    ("allow two ladder rungs in one run",
+     "    elif nxt != int(stage):", "    elif False:"),
+
+    ("stop binding the approved stage into the fingerprint",
+     "        e[\"action_fp\"] = _stage_binding(stage)",
+     "        e[\"action_fp\"] = \"\"  # MUTANT"),
+
+    ("send an idempotency key Xero ignores on this endpoint",
+     "        st, hd, body = api(\"POST\", \"Invoices/%s/Email\" % e[\"id\"], token, body={})",
+     "        st, hd, body = api(\"POST\", \"Invoices/%s/Email\" % e[\"id\"], token, body={},\n                           extra_headers={\"Idempotency-Key\": idem_key(plan[\"plan_id\"], plan[\"plan_fp\"], 0, {})})"),
+
+    ("chase a fully paid invoice instead of releasing it",
+     "            if float(inv.get(\"AmountDue\") or 0) <= 0:\n                excluded.append",
+     "            if False:\n                excluded.append"),
+
+    ("write the dunning chain without chaining to the previous hash",
+     "    prev = events[-1][\"hash\"] if events else None",
+     "    prev = None"),
+
+    ("hold a part-payment forever by never recording the hold",
+     "            dunning_append(iid, stage, DUNNING_HOLD,",
+     "            _ = (lambda *a, **k: None)(iid, stage, DUNNING_HOLD,"),
+
     ("write files without the sandbox prefix",
      "FILE_PREFIX = \"xero_ledger_\"", "FILE_PREFIX = \"xero_\""),
 
