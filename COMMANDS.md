@@ -685,12 +685,20 @@ chased one.
 
 The last two have no API-side guard, which is why they are ours.
 
-**The greeting rule.** Xero's template greets by the contact's *personal* first
-name and does **not** fall back to the company name — verified by a live send
-that arrived opening `Hi ,`. This checks `FirstName` and then the first contact
-person's `FirstName`, reading the **value** rather than key presence, because
-Xero omits the key on some records and returns `""` on others, exactly as it
-does for `EmailAddress`.
+**The greeting rule.** Xero greets by `Contact.FirstName` and does **not** fall
+back to the company name. Confirmed by reading delivered mail, not inferred:
+three invoices sent the same day gave *"Hi Ayesha,"* for a contact with a first
+name and *"Hi ,"* for two without.
+
+This checks **`FirstName` only**, reading the value rather than key presence
+(Xero omits the key on some records and returns `""` on others, exactly as for
+`EmailAddress`). A **contact person's** name is detected but deliberately does
+**not** satisfy the rule: whether Xero's template falls back to one is
+unverified — the probe that would have settled it collapsed because Xero
+silently dropped `ContactPersons` on a contact create — and accepting an
+unproven fallback would let a contact through and still send `Hi ,`. UNKNOWN is
+never a pass. Such a contact is excluded with its own reason, since the fix
+differs: set a `FirstName` on the contact.
 
 Refused by default; `allow_empty_greeting: true` sends anyway. The default is
 refusal because a dunning email that opens `Hi ,` undermines the request it is
@@ -699,10 +707,11 @@ send one is bound into the approval and appears on the receipt — a decision
 somebody made, not an accident. `greeting_policy` in the output states which
 mode ran, and `counts.no_greeting_name` says how many were excluded for it.
 
-**What reaches the customer.** The wrapper is Xero's — subject, greeting, layout,
-and the sender, `messaging-service@post.xero.com`, under the organisation's
-display name. The invoice **line descriptions do reach the customer**, so
-invoice content is yours even though the envelope is not.
+**What reaches the customer.** The wrapper is Xero's — subject fixed as
+`Invoice #<number> from <org> is due`, plus greeting and layout. The sender is
+`messaging-service@post.xero.com`, displayed under **the authorising Xero
+user's name, not the organisation's**. The invoice **line descriptions do reach
+the customer**, so invoice content is yours even though the envelope is not.
 
 **One rung per run.** An invoice forty days overdue with nothing sent is owed
 stage 7, not stage 21, and never both in one run — so a workflow that has not run

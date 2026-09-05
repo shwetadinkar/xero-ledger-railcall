@@ -61,8 +61,10 @@
         "connection_id": "string",
         "inferred_scopes": "object",
         "rate": "object",
-        "token": "object",
-        "limits": "array"
+        "limits": "array",
+        "credential_state": "object",
+        "configured_tenant": "string",
+        "tenant_matches": "boolean"
       },
       "schedulable": false,
       "description": "Probes each scope group with one cheap read and reports what the API refused. Xero publishes no granted-scope set, so this is inference, never introspection. Also reports the tenant list, the connection id, live rate-limit quota and when the refresh token last rotated."
@@ -119,7 +121,8 @@
       "output_schema": {
         "artifact": "string",
         "counts": "object",
-        "limits": "array"
+        "limits": "array",
+        "total_findings": "number"
       },
       "schedulable": true,
       "description": "Scans for drafts past N days, overdue authorised invoices bucketed for dunning, overpaid invoices, and contacts missing a default account or tax type. Every finding names the governed command that would fix it."
@@ -140,7 +143,10 @@
         "entries": "number",
         "chain_intact": "string",
         "first_break": "string",
-        "limits": "array"
+        "limits": "array",
+        "dunning_events": "number",
+        "dunning_chain_intact": "string",
+        "dunning_first_break": "string"
       },
       "schedulable": false,
       "description": "Hash-chain integrity check over every applied write and every refusal this module recorded. Tamper-evident, not tamper-proof: it detects edits and mid-chain deletion, not truncation of the tail by whoever holds the file."
@@ -222,7 +228,8 @@
         "failed": "number",
         "refused": "number",
         "artifact": "string",
-        "limits": "array"
+        "limits": "array",
+        "drift": "array"
       },
       "schedulable": false,
       "description": "Re-reads every invoice in the plan, recomputes the fingerprint, and refuses the WHOLE batch on any drift, naming the offending invoice. Uses summarizeErrors=false and reads the per-element verdict, because Xero returns HTTP 200 with per-element failures inside it. This is the point of no return: an AUTHORISED invoice can no longer be deleted, only voided."
@@ -290,11 +297,12 @@
         }
       },
       "output_schema": {
-        "voided": "number",
         "failed": "number",
         "refused": "number",
         "artifact": "string",
-        "limits": "array"
+        "limits": "array",
+        "drift": "array",
+        "committed": "number"
       },
       "schedulable": false,
       "description": "Re-reads every invoice, refuses if a payment landed since plan, if AmountPaid moved at all, if a credit note was allocated, if the status changed, or if the period closed. Xero itself refuses a void on a paid invoice; this refuses earlier and names what changed."
@@ -367,7 +375,8 @@
         "failed": "number",
         "refused": "number",
         "artifact": "string",
-        "limits": "array"
+        "limits": "array",
+        "drift": "array"
       },
       "schedulable": false,
       "description": "Re-reads every invoice and refuses on drift in AmountDue AND in AmountPaid. A rising AmountPaid means a payment landed while the allocation sat in review. Unlike a posted invoice, a payment recorded here can be deleted afterwards - this is the one reversible write in the module."
@@ -487,7 +496,8 @@
         "failed": "number",
         "refused": "number",
         "artifact": "string",
-        "limits": "array"
+        "limits": "array",
+        "drift": "array"
       },
       "schedulable": false,
       "description": "Re-reads every invoice and re-reads the dunning record before sending anything, then refuses the WHOLE batch if any invoice drifted or if any stage has been sent since the plan was approved. Xero applies no deduplication to invoice emails - five sends produce five deliveries - so this record is the only guard, and an email cannot be recalled. The message body is Xero's own standard invoice template; this governs when a customer is chased, not what the message says."

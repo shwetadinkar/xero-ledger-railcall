@@ -730,17 +730,28 @@ _L_SEND_BODY = ("the message body is Xero's own standard invoice template. This 
                 "endpoint accepts and discards any custom subject or body.")
 _L_SEND_DELIV = ("Xero reports the send, not delivery. A recorded send is not a "
                  "received email, and a bounce is invisible here.")
+_L_SEND_QUOTA = ("sending can start refusing with an opaque HTTP 500 while the "
+                 "tenant rate counters are healthy and Xero reports no "
+                 "incident. Measured on a real org: after roughly nine sends "
+                 "in a day every further send failed for at least 7.5 minutes "
+                 "with no Retry-After, and Xero recorded no send. Cause "
+                 "unconfirmed — a daily send quota and an anti-abuse block look "
+                 "identical from here. This command halts on the first such "
+                 "failure rather than working through a batch that is no longer "
+                 "sending.")
 _L_REACH = ("the recipient address is never present on the invoice payload; it "
             "comes from a separate Contacts read. A contact with no address "
             "cannot be emailed at all, so the reachable count is reported rather "
             "than assumed.")
-_L_GREETING = ("Xero's template greets by the contact's personal first name and "
-               "does NOT fall back to the company name — a contact without one "
-               "receives an email opening \"Hi ,\". Verified live. By default "
-               "such a contact is refused at plan time; set "
-               "allow_empty_greeting=true to send anyway, which puts that "
-               "decision inside the approved inputs rather than leaving it to "
-               "chance.")
+_L_GREETING = ("Xero's template greets by Contact.FirstName and does NOT fall "
+               "back to the company name — confirmed by reading delivered mail: "
+               "a contact with a first name got \"Hi Ayesha,\" and two without "
+               "got \"Hi ,\". A contact person's name is NOT counted, because "
+               "whether Xero falls back to one is unverified and accepting it "
+               "would let a broken greeting through. By default a nameless "
+               "contact is refused at plan time; allow_empty_greeting=true "
+               "sends anyway, which puts that decision inside the approved "
+               "inputs rather than leaving it to chance.")
 _L_EMAIL_ABSENT = ("Xero is inconsistent about a missing address: some contacts "
                    "carry EmailAddress as an empty string and others omit the "
                    "key entirely. Both are counted as no address — a key-presence "
@@ -801,24 +812,41 @@ def _as_int(v, default):
 
 
 def _contact_greeting_name(contact):
-    """The name Xero's invoice template will greet by, or "".
+    """The name Xero's template greets by: `Contact.FirstName`, and ONLY that.
 
-    Learned from a live send: an invoice emailed to a contact with a company
-    `Name` and no personal first name arrived opening "Hi ," — Xero renders the
-    gap and does NOT fall back to the company name. A dunning email that opens
-    with a broken greeting undermines the exact request it is making, and like
-    any send it cannot be recalled.
+    Confirmed by reading delivered mail, not inferred. Three invoices were sent
+    from one org on the same day:
 
-    Checks `FirstName` and then the first contact person, because both are
-    plausible template sources and covering both is cheaper than being wrong.
+        FirstName = "Ayesha"          -> "Hi Ayesha,"
+        no personal name at all       -> "Hi ,"
+        no personal name at all       -> "Hi ,"
+
+    Xero renders the gap and does NOT fall back to the company `Name`. A dunning
+    email opening "Hi ," undermines the request it is making, and like any send
+    it cannot be recalled.
+
+    A CONTACT PERSON'S first name is deliberately NOT accepted here. Whether
+    Xero's template falls back to one is unverified — the probe that would have
+    answered it collapsed because Xero silently dropped `ContactPersons` on a
+    contact create, so that case was indistinguishable from the control.
+    Accepting it would let a contact through this check and still send "Hi ,",
+    which is the one outcome the rule exists to prevent. UNKNOWN is never a
+    pass, so an unproven fallback does not count as a name.
+
     Absence has the same two shapes as EmailAddress — Xero omits the key on some
     records and returns "" on others — so this tests the VALUE, never presence.
     """
-    c = contact or {}
-    first = str(c.get("FirstName") or "").strip()
-    if first:
-        return first
-    for p in (c.get("ContactPersons") or []):
+    return str((contact or {}).get("FirstName") or "").strip()
+
+
+def _contact_person_name(contact):
+    """A contact person's first name, if the contact carries one.
+
+    Reported separately so an excluded row can say "there is a contact person,
+    but Xero's use of it is unverified" rather than the blunter "no name" — the
+    operator's fix differs between the two.
+    """
+    for p in ((contact or {}).get("ContactPersons") or []):
         pn = str((p or {}).get("FirstName") or "").strip()
         if pn:
             return pn
@@ -1542,7 +1570,9 @@ def xero_accounting_list_contacts(inputs, stamp):
             # that Xero may also have omitted entirely.
             "address_state": "set" if addr else "(none)",
             "greeting_name": _contact_greeting_name(c),
-            "greeting_state": "set" if _contact_greeting_name(c) else "(none)",
+            "greeting_state": ("set" if _contact_greeting_name(c)
+                               else ("(contact person only — unverified)"
+                                     if _contact_person_name(c) else "(none)")),
             "contact_status": c.get("ContactStatus"),
             "is_customer": c.get("IsCustomer"),
             # Carried for the v0.2 work that wanted a per-contact describe:
@@ -1588,7 +1618,7 @@ def _stage_binding(stage):
 
 
 def _reminder_blockers(inv, addr, greeting, hist, stage, ladder, now,
-                       allow_empty_greeting=False):
+                       allow_empty_greeting=False, person=""):
     """Every reason this invoice cannot be sent stage `stage`. Empty = eligible.
 
     All three of the probed refusal rules are checked HERE, at plan time, so an
@@ -1618,10 +1648,19 @@ def _reminder_blockers(inv, addr, greeting, hist, stage, ladder, now,
     # decision to send a nameless greeting travels through the approval hash and
     # onto the receipt instead of happening by accident.
     if not allow_empty_greeting and not greeting:
-        reasons.append("the contact has no personal first name, so Xero's "
-                       "template would open \"Hi ,\" — it does not fall back to "
-                       "the company name. Set allow_empty_greeting=true to send "
-                       "anyway.")
+        if person:
+            reasons.append("the contact has no FirstName of its own — only a "
+                           "contact person. Xero greets by Contact.FirstName "
+                           "(confirmed from delivered mail); whether it ever "
+                           "falls back to a contact person is unverified, so "
+                           "this is not counted as a name. Set FirstName on the "
+                           "contact, or allow_empty_greeting=true to send "
+                           "anyway.")
+        else:
+            reasons.append("the contact has no personal first name, so Xero's "
+                           "template would open \"Hi ,\" — it does not fall back "
+                           "to the company name. Set allow_empty_greeting=true "
+                           "to send anyway.")
 
     # RULE 3 — the load-bearing one. Xero does not dedupe; this record is the
     # only guard. Checked explicitly rather than left implied by the ladder
@@ -1715,6 +1754,7 @@ def xero_accounting_plan_send_reminder(inputs, stamp):
         contact = contacts.get(cid)
         addr = _contact_email(contact)
         greeting = _contact_greeting_name(contact)
+        person = _contact_person_name(contact)
         hist = history.get(iid, [])
 
         # PAID EXITS FIRST, before any stage arithmetic and before the
@@ -1754,9 +1794,9 @@ def xero_accounting_plan_send_reminder(inputs, stamp):
             continue
 
         reasons = _reminder_blockers(inv, addr, greeting, hist, stage, ladder,
-                                     now, allow_empty_greeting)
+                                     now, allow_empty_greeting, person)
         if reasons:
-            if any("Hi ," in r for r in reasons):
+            if any("allow_empty_greeting=true" in r for r in reasons):
                 nameless += 1
             excluded.append({"number": inv.get("InvoiceNumber"), "invoice_id": iid,
                              "reasons": reasons})
@@ -1781,7 +1821,7 @@ def xero_accounting_plan_send_reminder(inputs, stamp):
                             {"stage": stage, "ladder": ladder,
                              "excluded": excluded})
     limits = [_L_SEND, _L_SEND_BODY, _L_REACH, _L_EMAIL_ABSENT, _L_GREETING,
-              _L_DRIFT,
+              _L_SEND_QUOTA, _L_DRIFT,
               "reads only. Nothing is sent until apply_send_reminder runs with "
               "this plan_fp and a human approval.",
               "a part-payment holds the current stage for one cycle and does not "
@@ -1907,6 +1947,23 @@ def xero_accounting_apply_send_reminder(inputs, stamp):
                 errs = (els[0].get("ValidationErrors") if els else []) or []
                 msg = "; ".join(x.get("Message", "") for x in errs[:2]) or \
                       str(body.get("Message") or body.get("Detail") or "")[:160]
+            if st >= 500:
+                # Xero's 500 body is a generic "an error occurred, check the
+                # status page" blob that tells an operator nothing. Measured on
+                # a healthy org: sends began failing this way after ~9 in a day
+                # while the minute and day counters were fine and the status
+                # page was green, and did not recover in 7.5 minutes. Naming it
+                # here turns a dead end into something actionable — the handoff's
+                # rule that the production failure must produce a named error,
+                # not a generic one.
+                msg = ("Xero refused the send with HTTP %s and a generic error. "
+                       "The tenant rate counters and the status page are not the "
+                       "explanation: this has been measured on a healthy org "
+                       "after roughly nine sends in one day, persisting for at "
+                       "least 7.5 minutes with no Retry-After. Treat it as a "
+                       "send quota or an anti-abuse block and retry later — not "
+                       "as a fault in this batch. Xero recorded no send, so "
+                       "nothing was delivered." % st)
             failed.append({"number": e.get("number"), "error": msg or ("HTTP %s" % st)})
             dunning_append(e["id"], stage, DUNNING_FAILED,
                            {"number": e.get("number"), "error": msg or ("HTTP %s" % st)})
@@ -1930,7 +1987,7 @@ def xero_accounting_apply_send_reminder(inputs, stamp):
                          % (FILE_PREFIX, stamp.replace(":", "")))
     _h()["jsave"](rpath, result)
 
-    limits = [_L_SEND, _L_SEND_BODY, _L_SEND_DELIV]
+    limits = [_L_SEND, _L_SEND_BODY, _L_SEND_DELIV, _L_SEND_QUOTA]
     if failed:
         limits.append("halted at the first failure. %d reminder(s) went out "
                       "before it and are named in the artifact. Nothing was "

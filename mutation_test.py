@@ -71,18 +71,25 @@ MUTATIONS = [
      "    overdue_days = _as_int(inputs.get(\"overdue_days\"), 1)",
      "    overdue_days = int(inputs.get(\"overdue_days\") or 1)"),
 
+    ("pass Xero's generic 500 blob through instead of naming it",
+     "            if st >= 500:", "            if False:"),
+
     # ---- v0.1.2 greeting rule
 
     ("skip the empty-greeting check",
      "    if not allow_empty_greeting and not greeting:", "    if False:"),
 
+    ("accept an unverified contact-person name as a greeting",
+     "    return str((contact or {}).get(\"FirstName\") or \"\").strip()\n\n\ndef _contact_person_name",
+     "    return (str((contact or {}).get(\"FirstName\") or \"\").strip()\n            or _contact_person_name(contact))\n\n\ndef _contact_person_name"),
+
     ("treat the company name as a greeting fallback",
-     "    first = str(c.get(\"FirstName\") or \"\").strip()",
-     "    first = str(c.get(\"FirstName\") or c.get(\"Name\") or \"\").strip()"),
+     "    return str((contact or {}).get(\"FirstName\") or \"\").strip()\n\n\ndef _contact_person_name",
+     "    return str((contact or {}).get(\"FirstName\") or (contact or {}).get(\"Name\") or \"\").strip()\n\n\ndef _contact_person_name"),
 
     ("treat a present-but-empty FirstName as a name",
-     "    first = str(c.get(\"FirstName\") or \"\").strip()",
-     "    first = \"x\" if \"FirstName\" in c else \"\""),
+     "    return str((contact or {}).get(\"FirstName\") or \"\").strip()\n\n\ndef _contact_person_name",
+     "    return (\"x\" if \"FirstName\" in (contact or {}) else \"\")\n\n\ndef _contact_person_name"),
 
     # ---- v0.1.2 binding. The first is the one that moves money.
 

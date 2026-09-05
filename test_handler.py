@@ -1197,7 +1197,10 @@ def t_an_untampered_void_plan_still_applies():
 
 # ─────────────────────── v0.1.2 — the greeting rule
 
-def t_greeting_name_reads_value_not_key_and_falls_back_to_a_person():
+def t_greeting_name_is_FirstName_only_and_reads_the_value():
+    """Confirmed by reading delivered mail: FirstName="Ayesha" arrived as
+    "Hi Ayesha,"; two contacts with no personal name both arrived as "Hi ,".
+    Neither the company Name nor a contact person may stand in."""
     f = H["_contact_greeting_name"]
     assert f({"FirstName": "Ayesha"}) == "Ayesha"
     assert f({"FirstName": ""}) == ""                 # present but empty
@@ -1205,9 +1208,10 @@ def t_greeting_name_reads_value_not_key_and_falls_back_to_a_person():
     assert f({"FirstName": "  "}) == ""
     assert f({"Name": "Acme Ltd"}) == "", \
         "the company name is NOT a fallback — Xero renders 'Hi ,' instead"
-    assert f({"ContactPersons": [{"FirstName": "Bhavna"}]}) == "Bhavna"
-    assert f({"FirstName": "Ayesha",
-              "ContactPersons": [{"FirstName": "Bhavna"}]}) == "Ayesha"
+    assert f({"ContactPersons": [{"FirstName": "Bhavna"}]}) == "", \
+        "a contact person is UNVERIFIED as a greeting source and must not count"
+    assert H["_contact_person_name"]({"ContactPersons": [{"FirstName": "Bhavna"}]}) \
+        == "Bhavna", "but it must still be detectable, for the refusal reason"
 
 
 def t_a_contact_with_no_first_name_is_refused_by_default():
@@ -1243,17 +1247,27 @@ def t_the_nameless_override_travels_through_the_inputs():
         "an override that is not a declared input cannot reach the approval"
 
 
-def t_a_contact_person_first_name_satisfies_the_greeting():
+def t_a_contact_person_alone_does_NOT_satisfy_the_greeting():
+    """UNKNOWN is never a pass. Whether Xero's template falls back to a contact
+    person is unverified — the probe that would have answered it collapsed
+    because Xero silently dropped ContactPersons on a contact create. Accepting
+    it would let a contact through and still send "Hi ,", which is the one
+    outcome this rule exists to prevent."""
     reset()
-    out, _ = _plan_stage(contacts=[_contact("c1", "a@example.com", first=None,
-                                            persons=[{"FirstName": "Bhavna"}])])
-    assert out["counts"]["eligible"] == 1, out["counts"]
+    out, plan = _plan_stage(contacts=[_contact("c1", "a@example.com", first=None,
+                                               persons=[{"FirstName": "Bhavna"}])])
+    assert out["counts"]["eligible"] == 0, out["counts"]
+    assert out["counts"]["no_greeting_name"] == 1, out["counts"]
+    reasons = plan["excluded"][0]["reasons"]
+    assert any("only a contact person" in r for r in reasons), reasons
+    assert any("unverified" in r for r in reasons), reasons
 
 
 def t_the_greeting_limit_is_in_the_output():
     reset()
     out, _ = _plan_stage()
     assert any("Hi ," in x for x in out["limits"]), out["limits"]
+    assert any("Contact.FirstName" in x for x in out["limits"]), out["limits"]
     assert any("allow_empty_greeting" in x for x in out["limits"]), out["limits"]
 
 
@@ -1613,6 +1627,83 @@ def t_overdue_days_zero_is_honoured_not_replaced_by_the_default():
     assert _FILES[out["artifact"]]["thresholds"]["overdue_days"] == 0, \
         _FILES[out["artifact"]]["thresholds"]
     assert out["counts"].get("overdue") == 1, out["counts"]
+
+
+def t_a_500_on_send_is_named_not_passed_through_raw():
+    """Measured on a healthy real org: sends began failing with an opaque HTTP
+    500 while the minute and day counters were fine and Xero's status page was
+    green, and did not recover in 7.5 minutes. Xero's 500 body is a generic
+    "check the status page" blob, which sends an operator to a page that says
+    everything is fine.
+
+    The handoff's rule: the production failure must produce a NAMED, actionable
+    error rather than a generic one."""
+    reset()
+    out, _ = _plan_stage(stage=7)
+    _ready()
+    queue(200, {"Invoices": [_inv()]})
+    queue(200, {"Contacts": [_contact()]})
+    queue(500, {"Title": "An error occurred",
+                "Detail": "An error occurred in Xero. Check the API Status page",
+                "Status": 500})
+    res, _ = H["xero_accounting_apply_send_reminder"](
+        {"plan_path": out["artifact"], "plan_fp": out["plan_fp"]},
+        "2026-09-04T00:01:00Z")
+    assert res["sent"] == 0 and res["failed"] == 1, res
+    err = _FILES[res["artifact"]]["failed"][0]["error"]
+    assert "status page" not in err.lower() or "not the explanation" in err, err
+    assert "quota" in err or "anti-abuse" in err, err
+    assert "nothing was delivered" in err, err
+    assert any("opaque HTTP 500" in x for x in res["limits"]), res["limits"]
+
+
+def t_the_send_quota_limit_is_stated_at_plan_time_too():
+    """An operator reads the plan before approving. A failure mode that can stop
+    a batch halfway belongs where the decision is made, not only in the error."""
+    reset()
+    out, _ = _plan_stage(stage=7)
+    assert any("opaque HTTP 500" in x for x in out["limits"]), out["limits"]
+
+
+def t_output_schema_matches_what_the_handler_returns():
+    """A stale output_schema is a lie a workflow author reads.
+
+    Found while composing the dunning workflow against this module:
+    `verify_connection` still declared an output field named `token` — the very
+    name the redactor masks, and one the handler renamed to `credential_state`
+    long ago — and `verify_ledger` did not declare the dunning fields it
+    returns. Nothing enforces output_schema at runtime, so both were invisible
+    until someone tried to bind them.
+
+    Checks the commands this suite can drive without a network.
+    """
+    SECRET_HINT = ("token", "key", "secret", "password", "apikey",
+                   "authorization", "bearer", "dsn")
+    m = json.load(open(os.path.join(HERE, "module.json"), encoding="utf-8"))
+    schema = {c["id"].split(".")[-1]: (c.get("output_schema") or {})
+              for c in m["commands"]}
+
+    for cmd, declared in schema.items():
+        bad = [k for k in declared if any(h in k.lower() for h in SECRET_HINT)]
+        assert not bad, "%s declares output field(s) the redactor masks: %s" % (cmd, bad)
+
+    reset()
+    H["dunning_append"]("i1", 7, "sent", {"number": "INV-1"})
+    out, _ = H["xero_accounting_verify_ledger"]({}, "2026-09-05T00:00:00Z")
+    missing = [k for k in out if k not in schema["verify_ledger"]]
+    assert not missing, "verify_ledger returns undeclared field(s): %s" % missing
+
+    reset()
+    _ready()
+    queue(200, {"Contacts": [_contact()]})
+    out, _ = H["xero_accounting_list_contacts"]({}, "2026-09-05T00:00:00Z")
+    missing = [k for k in out if k not in schema["list_contacts"]]
+    assert not missing, "list_contacts returns undeclared field(s): %s" % missing
+
+    reset()
+    out, _ = _plan_stage(stage=7)
+    missing = [k for k in out if k not in schema["plan_send_reminder"]]
+    assert not missing, "plan_send_reminder returns undeclared field(s): %s" % missing
 
 
 # ─────────────────────────────────────────────────────────── runner

@@ -111,17 +111,23 @@ technical one, so the command states it in its own output instead of leaving an
 operator to infer it. A *fully* paid invoice leaves the chain immediately, before
 any stage arithmetic runs.
 
-**A contact with no first name is refused by default.** Xero's template greets
-by the *personal* first name and does not fall back to the company name, so a
-contact without one receives an email opening `Hi ,`. Xero sends that happily —
+**A contact with no first name is refused by default.** Confirmed by reading
+delivered mail: `FirstName = "Ayesha"` arrived as *"Hi Ayesha,"*, and two
+contacts with no personal name both arrived as *"Hi ,"*. Xero greets by
+`Contact.FirstName` and does not fall back to the company name. A contact
+person's name is **not** counted — whether Xero falls back to one is unverified,
+and accepting it would let a broken greeting through. Xero sends that happily —
 it is not an API refusal, it is a quality one, and it is as unrecallable as any
 other send. `allow_empty_greeting=true` overrides it. That override is an
 **input**, so the decision to send a nameless greeting travels through the
 approval hash and onto the receipt, rather than happening by accident.
 
 **What is ours and what is not.** The email *wrapper* is Xero's — subject,
-greeting, layout, and the sender, which is `messaging-service@post.xero.com`
-under the organisation's display name. The invoice **line descriptions do reach
+greeting and layout. The subject is fixed as
+`Invoice #<number> from <org> is due`. The sender is
+`messaging-service@post.xero.com` displayed under **the authorising Xero user's
+name, not the organisation's** — so whoever's credential the module runs on is
+the name a customer sees. The invoice **line descriptions do reach
 the customer**, so the content of what they read about is ours even though the
 envelope is not. That is the seam this module works along.
 
